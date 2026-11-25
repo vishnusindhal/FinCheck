@@ -209,5 +209,6 @@ function downloadFile(filename, content, mimeType) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  // Revoking synchronously can cancel the download in Chromium; give it time to start.
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }

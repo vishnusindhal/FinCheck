@@ -4,20 +4,20 @@ IDs are stable — reference them in commits and CHANGELOG. When fixing one, mov
 
 Severity: 🔴 blocking / security · 🟠 functional bug · 🟡 limitation / debt
 
-_Last full review: 2026-11-25. Fixes on 2026-11-25 are covered by the offline test suite (`tests/`, 36 tests); none have been exercised against a real PostgreSQL database or the real Gemini API yet._
+_Last full review: 2026-11-25. Fixes are covered by the offline suite (37 tests) **and were verified live on 2026-11-25** against real PostgreSQL + Gemini + Chrome (43/43 API, 38/38 UI checks — see TESTING.md)._
 
 ## Open
 
 | ID | Sev | Issue | Location | Notes |
 |---|---|---|---|---|
-| R1 | 🟠 | **Not runtime-verified against real services.** New SQL (per-user unique indexes, `DROP CONSTRAINT IF EXISTS invoices_vendor_name_invoice_number_key` / `purchase_orders_po_number_key`, `received_date IS NOT DISTINCT FROM`, `ANY(%s)`) and the Gemini prompt changes have only run against fakes | `db.py`, `auth_db.py`, `system_prompt.py` | First real startup applies migrations automatically. If the old constraint had a non-default name it stays, and cross-user duplicates then show up as `rejected_duplicate` (handled, not a crash) |
+| R2 | 🟡 | Migration verified only on a **fresh** database (`fincheck_dev`). Migrating the existing `reconcile` DB (old global constraints + legacy rows) is untested | `db.migrate_per_user_uniqueness` | Back it up first (`pg_dump`). If the old constraint had a non-default name it stays; cross-user duplicates then show as `rejected_duplicate` (handled) |
 | S8 | 🟡 | JWT kept in `localStorage`; no revocation. *Partially mitigated:* default lifetime cut from 7 days to 1 day (`JWT_EXPIRE_MINUTES`) | `auth.js`, `auth.py` | Full fix = httpOnly cookies + CSRF protection; that's a design decision across the HF Space + Vercel origins |
 | L1 | 🟡 | Matching keys line items by exact normalized description; different wording for the same item is reported as "not on PO" / "not received" | `matching.py` | Product limitation (D8) |
 | L2 | 🟡 | Legacy rows created before per-user ownership (`user_id IS NULL`) are invisible to every user's PO/GR lookups and duplicate checks | `db.py` | Intentional for isolation; back-fill `user_id` manually if needed |
 | L3 | 🟡 | Background retrain re-fits on **all** invoices after every completed run (skipped if one is already running) | `anomaly_detection/train.py:retrain_in_background` | Fine for a prototype; schedule/batch it at larger volumes |
 | L4 | 🟡 | Rule weights, thresholds and keyword categories are hard-coded | `risk_analysis.py`, `classify.py`, `matching.py` | Roadmap "policy engine" |
 | L5 | 🟡 | `/_vercel/insights/script.js` 404s when not hosted on Vercel | `frontend/index.html` | Harmless |
-| E1 | 🟡 | Environment: `.env` DB port 5432 vs local Postgres log 5433; configured `MODEL_NAME` must exist for the key; `.venv` copied from another path (use `python -m ...`) | local machine | Not code issues — check before running |
+| E1 | 🟡 | Environment: PostgreSQL 17.6 runs on **5432** (matches `.env`); the `.local-postgres/` 5433 instance is not running and unused. `MODEL_NAME` works but Gemini often returns 503 "overloaded" (retries recover; runs can take ~1 min). An **older uvicorn (pre-fix code) was running on port 8000** during testing — restart it to pick up the fixes. `.venv` copied from another path (use `python -m ...`) | local machine | Not code issues |
 
 ## Resolved
 
@@ -91,4 +91,8 @@ All resolved 2026-11-25 (Claude Code). Test references are in `tests/`.
 | A11 | Invalid escape sequences | `__main__` blocks rewritten |
 | A12 | No tests | `tests/` (36 offline tests), `pytest.ini` |
 | A13 | README wrong setup / unverifiable claims | README corrected |
+| R1 | Not runtime-verified against real services | 2026-11-25: verified live — see TESTING.md |
+| — | (found live) Explanation said "Flagged…" for auto-approved invoices | `process_context` passes `decision`; prompt adapts wording. Test: `test_explanation_context_carries_decision` |
+| — | (found live) Missing favicon → console 404 | Inline SVG favicon in `index.html` |
+| — | (found live) Blob URL revoked synchronously could cancel exports | `invoices.downloadFile` revokes after 10 s |
 | E2 | No project-level git repository | 2026-11-25: repo initialized in `FinCheck/`, pushed to https://github.com/vishnusindhal/FinCheck; `.gitattributes` marks PDF/PNG binary |

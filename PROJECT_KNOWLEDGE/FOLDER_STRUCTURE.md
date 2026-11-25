@@ -14,7 +14,8 @@ FinCheck/
 ├── pytest.ini                    # testpaths = tests
 ├── .dockerignore                 # keeps .env/.venv/local DB/models out of images
 ├── tests/                        # Offline pytest suite (conftest fakes DB + Gemini)
-│   └── conftest.py, test_rules.py, test_graph.py, test_api.py
+│   ├── conftest.py, test_rules.py, test_graph.py, test_api.py
+│   └── e2e/                      # Live checks (real DB/Gemini/Chrome): run_dev_server.py, e2e_api.py, e2e_ui.py
 ├── .env                          # Local secrets — gitignored. NEVER copy values into docs
 ├── .gitignore                    # Ignores .env, /data, /test, /models, notebooks, .venv, .local-postgres*, todo.txt
 ├── .gitattributes                # Git LFS patterns (HF Spaces default template)

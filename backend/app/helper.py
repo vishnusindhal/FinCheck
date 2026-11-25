@@ -175,6 +175,7 @@ def process_context(report: dict) -> dict:
     return {
         "invoice_number": report.get("invoice_number"),
         "vendor_name": report.get("vendor_name"),
+        "decision": (stages.get("approval") or {}).get("decision"),
         "risk_level": risk.get("tier"),
         "risk_score": risk.get("score"),
         "signals": signals,

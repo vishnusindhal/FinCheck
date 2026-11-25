@@ -32,14 +32,14 @@ Every AI coding agent (and human) must read this folder before changing code. Th
 - **Backend entry point:** [backend/app/main.py](../backend/app/main.py) — run from the project root as `python -m uvicorn backend.app.main:app --port 8000` (imports are absolute `backend.app.*`). UI served at `/ui/`.
 - **Pipeline definition:** [backend/app/agent.py](../backend/app/agent.py).
 - **Frontend:** static files in [frontend/](../frontend/); backend URL resolved in [frontend/js/config.js](../frontend/js/config.js).
-- **Tests:** `python -m pytest` (offline, 36 tests) — see TESTING.md.
+- **Tests:** `python -m pytest` (offline, 37 tests) + live end-to-end scripts in `tests/e2e/` — see TESTING.md.
 - **Repository:** https://github.com/vishnusindhal/FinCheck (`main`). History starts with a pre-fix baseline commit, then the 2026-11-25 fix commit.
 
 ## Verification legend used across these docs
 
 - **Verified (code)** — confirmed by reading the source code on 2026-11-25.
 - **Verified (tests)** — covered by the offline pytest suite.
-- **Verified (runtime)** — confirmed against real PostgreSQL/Gemini/browser. *Not done yet.*
+- **Verified (runtime)** — confirmed against real PostgreSQL/Gemini/browser (done 2026-11-25, `tests/e2e/`).
 - **Unverified / claimed** — stated in README or other docs but not provable from the repository.
 - **Planned** — not implemented.
 

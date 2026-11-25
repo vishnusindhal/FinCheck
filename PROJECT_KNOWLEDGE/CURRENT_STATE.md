@@ -1,10 +1,10 @@
 # Current State
 
-_Last updated: 2026-11-25 by Claude Code (bulk fix of all issues found in the initial analysis)._
+_Last updated: 2026-11-25 by Claude Code (live end-to-end verification)._
 
 ## Summary
 
-All bugs, security gaps and tech-debt items from the initial analysis have been fixed in code (see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) → Resolved). An offline automated test suite now exists and passes (**36/36**). The app has **not** yet been started against the real PostgreSQL database or the real Gemini API — that's the main remaining verification step.
+All issues from the initial analysis are fixed, and the app has been **verified live** with the sample PDFs: real PostgreSQL + real Gemini + headless Chrome — **43/43 API checks, 38/38 browser checks (no JS errors), 37/37 offline tests**. Details in [TESTING.md](TESTING.md).
 
 ## Verification status
 
@@ -14,9 +14,11 @@ All bugs, security gaps and tech-debt items from the initial analysis have been 
 | Graph routing: auto-approve, interrupt → resume, invoice-only, invalid, per-user duplicate, duplicate-PO warning | ✅ verified with `MemorySaver` + fakes |
 | API: SSE events order, run row gets `invoice_id`, provisional report, resume ownership / double resume, cleanup on failure, upload validation, auth on data endpoints | ✅ verified with `TestClient` + fakes |
 | Python compiles without warnings; all `frontend/js/*.js` pass `node --check`; every JS element id exists in `index.html` | ✅ verified |
-| Real PostgreSQL (auto-migrations, SQL) | ❌ not run |
-| Real Gemini extraction with new confidence prompt | ❌ not run |
-| Browser click-through of the UI | ❌ not run |
+| Real PostgreSQL (auto-migrations on a fresh DB, all SQL paths) | ✅ verified live (`fincheck_dev`) |
+| Real Gemini extraction + confidences + explanation | ✅ verified live (sample sets exact; confidences 1.0) |
+| Browser UI end to end | ✅ verified live (headless Chrome, `tests/e2e/e2e_ui.py`) |
+| Migrating the existing `reconcile` DB | ❌ not done on purpose (R2) |
+| Docker image build | ❌ not run |
 
 ## What changed (high level)
 - Backend: per-user isolation everywhere, transactional persistence + cleanup, ownership-checked resume that no longer needs the browser's thread id, provisional reports for pending runs, stopped reports for early exits, real `node_start` SSE events, non-blocking streaming, pooled DB connections, lazy LLM clients, startup schema init, history-aware anomaly features with background retraining.
@@ -32,9 +34,9 @@ All bugs, security gaps and tech-debt items from the initial analysis have been 
 - PO/GR/invoice lookups only see rows owned by the caller (legacy NULL-owner rows are hidden).
 
 ## Recommended next steps
-1. Start the stack against a **dev** database (`python -m uvicorn backend.app.main:app --port 8000`), confirm migrations log no warnings, open `http://localhost:8000/ui/`.
-2. Run both sample sets (`output/pdf/fincheck-samples/`); check extraction confidences look sensible and the mismatch set pauses for review; approve from the history sidebar after a page reload.
-3. Record results here and in TESTING.md; mark R1 resolved if all is well.
+1. The old uvicorn on port 8000 still runs pre-fix code — stop it and start the new code (`python -m uvicorn backend.app.main:app --port 8000`).
+2. Before pointing the new code at `reconcile`, back it up (`pg_dump`) — startup migrates it (R2). Or keep using `fincheck_dev` / set `AUTO_INIT_DB=false`.
+3. Build and smoke-test the Docker image.
 4. Decide on token storage (S8).
 
 ## Files not inspected / unverified (unchanged from initial analysis)

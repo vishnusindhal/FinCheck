@@ -4,6 +4,11 @@ Chronological record of significant changes. Newest first. Reference KNOWN_ISSUE
 
 Git history starts on 2026-11-25 (baseline import of the code as found); entries before that are reconstructed and approximate.
 
+## 2026-11-25 — Live end-to-end verification
+- Ran the app against real PostgreSQL (`fincheck_dev`), real Gemini and headless Chrome with the sample PDFs: 43/43 API checks, 38/38 UI checks.
+- Fixed issues found live: explanation wording for approved invoices (`helper.process_context` adds `decision`, prompt updated), inline favicon, deferred blob-URL revoke on exports.
+- Added `tests/e2e/` (`run_dev_server.py`, `e2e_api.py`, `e2e_ui.py`) and a regression unit test.
+
 ## 2026-11-25 — Version control set up
 - Initialized git in `FinCheck/` with remote `https://github.com/vishnusindhal/FinCheck`; baseline commit of the original code, followed by the fix commit.
 - `.gitattributes`: `*.pdf`, `*.png`, `*.jpg` marked `binary` (the user's global `core.autocrlf=true` would otherwise treat the ReportLab PDFs as text).

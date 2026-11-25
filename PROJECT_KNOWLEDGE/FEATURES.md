@@ -1,7 +1,7 @@
 # Features
 
 Status key: ✅ implemented and covered by offline tests · ☑️ implemented (code + static checks, no automated test) · 📋 planned / claimed only.
-Nothing has been run against real PostgreSQL / Gemini or clicked through in a browser yet (KNOWN_ISSUES R1).
+**2026-11-25: every feature below was also verified live** (real PostgreSQL + Gemini + headless Chrome, sample PDFs) — `tests/e2e/`, 43/43 API + 38/38 UI checks. Exception: anomaly vendor models (needs ≥ 5 invoices per vendor).
 
 ## Backend
 

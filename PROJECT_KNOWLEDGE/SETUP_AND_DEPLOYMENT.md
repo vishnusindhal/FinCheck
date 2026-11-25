@@ -1,6 +1,6 @@
 # Setup and Deployment
 
-Status: the offline test suite has been run (36 passed, 2026-11-25). Starting the server against a real database / Gemini has **not** been done yet — update this file when it is.
+Status (2026-11-25): local run verified end to end against real PostgreSQL + Gemini + Chrome (see TESTING.md). Docker build not yet verified.
 
 ## Get the code
 ```bash
@@ -49,7 +49,7 @@ python -m pytest          # from the project root; offline, no DB/API key needed
 - Deploy `frontend/` as static files and define `window.FINCHECK_API_BASE` (inline script before `js/config.js`) pointing to the API.
 - Add that origin to `CORS_ORIGINS` on the backend.
 
-## Smoke test checklist (manual, not yet performed)
+## Smoke test checklist (automated by `tests/e2e/`; all passed 2026-11-25)
 1. `GET /api/health` → ok; server log shows no migration warnings.
 2. Sign up / log in at `/ui/`.
 3. Sample set 1 (`output/pdf/fincheck-samples/01-*`) → matched; low risk (+10 new vendor) → auto-approved; report view renders.

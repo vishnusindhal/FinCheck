@@ -87,6 +87,11 @@ def test_process_context_describes_real_issue_fields():
     assert "mismatch detected with" not in signals  # every field format recognised
 
 
+def test_explanation_context_carries_decision():
+    ctx = process_context({"stages": {"approval": {"decision": "auto_approved"}, "risk": {"tier": "low"}}})
+    assert ctx["decision"] == "auto_approved"
+
+
 def test_jsonable_handles_numpy_and_decimal():
     from decimal import Decimal
     out = jsonable({"a": np.int64(3), "b": [np.float64(1.5)], "c": Decimal("2.5"), "d": np.bool_(True)})

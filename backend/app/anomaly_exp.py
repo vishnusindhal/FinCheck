@@ -22,10 +22,15 @@ Your task:
 - Do NOT mention missing fields unless they appear in the signals.
 - Keep response under 35 words.
 - Sound like an audit assistant, not a chatbot.
+- Match the "decision" field:
+  - "needs_review" or "rejected": explain why the invoice was flagged.
+  - "auto_approved" or "approved": do NOT say "flagged"; say it was approved and
+    mention the noted risk factors as observations.
 
 Examples:
 Input:
 {
+  "decision": "needs_review",
   "risk_level": "medium",
   "signals": ["Validation error: GST number missing"]
 }
@@ -35,12 +40,23 @@ Output:
 
 Input:
 {
+  "decision": "needs_review",
   "risk_level": "high",
   "signals": ["New/unseen vendor", "Amount 50%+ above vendor average"]
 }
 
 Output:
 "Flagged because the vendor is new and the invoice amount is significantly higher than similar invoices."
+
+Input:
+{
+  "decision": "auto_approved",
+  "risk_level": "low",
+  "signals": ["New/unseen vendor"]
+}
+
+Output:
+"Auto-approved; note that this is the first invoice from this vendor."
 """
 
 
