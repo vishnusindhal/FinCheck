@@ -1,19 +1,22 @@
 /* ============================================================
    MAIN — shared element references, view switching, app init.
-   This must load AFTER index.html's elements exist, but its
-   `els` object is referenced by pipeline.js, report.js, history.js —
-   so keep this loaded early (right after auth.js) in index.html.
+   Loaded after auth.js; its `els` object is used by pipeline.js,
+   report.js and history.js.
    ============================================================ */
 
 const els = {
   viewUpload: document.getElementById("viewUpload"),
   viewPipeline: document.getElementById("viewPipeline"),
   viewReport: document.getElementById("viewReport"),
+  viewInvoices: document.getElementById("viewInvoices"),
+  comparisonPanel: document.getElementById("comparisonPanel"),
   uploadForm: document.getElementById("uploadForm"),
   submitBtn: document.getElementById("submitBtn"),
   formNote: document.getElementById("formNote"),
   stageList: document.getElementById("stageList"),
   pipelineTitle: document.getElementById("pipelineTitle"),
+  pipelineSub: document.getElementById("pipelineSub"),
+  pipelineError: document.getElementById("pipelineError"),
   ledgerList: document.getElementById("ledgerList"),
   ledgerEmpty: document.getElementById("ledgerEmpty"),
   statTotal: document.getElementById("statTotal"),
@@ -22,37 +25,49 @@ const els = {
   newInvoiceBtn: document.getElementById("newInvoiceBtn"),
   backToUploadBtn: document.getElementById("backToUploadBtn"),
   searchInput: document.getElementById("searchInput"),
-  viewInvoices: document.getElementById("viewInvoices"),
 };
 
 /* ============================================================
    VIEW SWITCHING
+   The comparison panel belongs to the invoices view and is closed
+   whenever the user navigates anywhere.
    ============================================================ */
 function showView(name) {
   els.viewUpload.hidden = name !== "upload";
   els.viewPipeline.hidden = name !== "pipeline";
   els.viewReport.hidden = name !== "report";
-  if (els.viewInvoices) {
-    els.viewInvoices.hidden = name !== "invoices";
-  }
+  els.viewInvoices.hidden = name !== "invoices";
+  els.comparisonPanel.hidden = true;
 }
 
-els.newInvoiceBtn.addEventListener("click", () => {
+function resetUploadForm() {
   els.uploadForm.reset();
   document.querySelectorAll(".dropzone").forEach(dz => {
     dz.classList.remove("filled");
     dz.querySelector(".dz-filename").textContent = "";
   });
+  els.formNote.textContent = "";
+}
+
+els.newInvoiceBtn.addEventListener("click", () => {
+  resetUploadForm();
   showView("upload");
 });
 
-els.backToUploadBtn.addEventListener("click", () => showView("upload"));
+els.backToUploadBtn.addEventListener("click", () => {
+  resetUploadForm();
+  showView("upload");
+});
 
 /* ============================================================
-   INIT — runs last, after every other file has defined what it needs
+   INIT — deferred until every script has executed, because
+   enterApp() → loadHistory() touches globals defined in later
+   files (e.g. currentRunId in report.js).
    ============================================================ */
-if (getToken()) {
-  enterApp();
-} else {
-  showAuthScreen(); 
-}
+document.addEventListener("DOMContentLoaded", () => {
+  if (getToken()) {
+    enterApp();
+  } else {
+    showAuthScreen();
+  }
+});

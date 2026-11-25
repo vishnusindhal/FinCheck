@@ -24,3 +24,6 @@ todo.txt
 /test
 
 /models
+
+# test caches
+.pytest_cache/

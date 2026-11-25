@@ -1,0 +1,20 @@
+# Never ship secrets or local state into the image
+.env
+.env.*
+.venv/
+venv/
+.local-postgres/
+.local-postgres.log
+.local-postgres-password
+models/
+data/
+test/
+notebooks/
+output/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.vscode/
+.idea/
+todo.txt

@@ -1,75 +1,108 @@
 /* ============================================================
-   REPORT VIEW — renders a finished pipeline run, plus the
-   human review Approve/Reject buttons.
+   REPORT VIEW — renders a pipeline run, plus human review
+   (Approve / Reject) for runs paused at the approval stage.
    Depends on: authFetch (auth.js), showView/els (main.js), loadHistory (history.js)
    ============================================================ */
 
-let currentRunId = null; // tracks which run is currently shown in the report view
-let currentThreadId = null; // Tracks the Thread Id for the run
+let currentRunId = null;     // run currently shown / being reviewed
+let currentThreadId = null;  // informational only — the server resolves a run's thread itself
 
-function renderReport(report, status) {
+const STOP_LABELS = {
+  rejected_invalid: "Rejected — invalid invoice",
+  rejected_duplicate: "Rejected — duplicate invoice",
+};
+
+/* run: optional {id, status, human_decision, reviewer_note, can_resume} */
+function renderReport(report, status, run = null) {
   if (!report) {
     els.pipelineTitle.textContent = `Stopped — ${status || "unknown reason"}`;
+    showView("pipeline");
     return;
   }
+  if (run?.id) currentRunId = run.id;
+  const stages = report.stages || {};
+  const runStatus = run?.status || status;
 
   document.getElementById("reportVendor").textContent = report.vendor_name || "Unknown vendor";
-  document.getElementById("reportMeta").textContent = `Invoice ${report.invoice_number || "—"} · processed ${formatTimestamp(report.generated_at)}`;
+  document.getElementById("reportMeta").textContent =
+    `Invoice ${report.invoice_number || "—"} · processed ${formatTimestamp(report.generated_at)}`;
 
-  const decision = report.stages?.approval?.decision;
+  // Headline decision
   const decisionEl = document.getElementById("reportDecision");
-  if (decision === "auto_approved") {
-    decisionEl.textContent = "Auto-approved";
-    decisionEl.className = "report-decision approved";
-  } else {
-    decisionEl.textContent = `Needs review — ${report.stages?.approval?.approver || ""}`;
-    decisionEl.className = "report-decision review";
-  }
+  const headline = headlineDecision(report, runStatus);
+  decisionEl.textContent = headline.text;
+  decisionEl.className = `report-decision ${headline.cls}`;
 
   document.getElementById("reportAmount").textContent = formatCurrency(report.total_amount, report.currency);
   document.getElementById("reportAmountSub").textContent = report.invoice_number || "—";
 
-  const v = report.stages?.validation || {};
-  setStatus("reportValidation", v.passed ? "Passed" : "Failed", v.passed ? "ok" : "flagged");
-  fillList("reportValidationErrors", v.errors || []);
+  const v = stages.validation;
+  if (v) {
+    setStatus("reportValidation", v.passed ? "Passed" : "Failed", v.passed ? "ok" : "flagged");
+    fillList("reportValidationErrors", v.errors || []);
+  } else {
+    setStatus("reportValidation", "Not run", "warn");
+    fillList("reportValidationErrors", []);
+  }
 
-  const m = report.stages?.matching || {};
-  setStatus("reportMatching", m.matched ? "Reconciled" : "Discrepancy found", m.matched ? "ok" : "flagged");
-  fillList("reportMatchingIssues", (m.issues || []).map(i => `${i.field}: expected ${i.expected}, got ${i.actual}`));
+  const m = stages.matching;
+  if (m) {
+    setStatus("reportMatching", m.matched ? "Reconciled" : "Discrepancy found", m.matched ? "ok" : "flagged");
+    fillList("reportMatchingIssues", (m.issues || []).map(i => `${i.field}: expected ${i.expected}, got ${i.actual}`));
+  } else {
+    setStatus("reportMatching", "Not run", "warn");
+    fillList("reportMatchingIssues", []);
+  }
 
-  const c = report.stages?.classification || {};
-  setStatus("reportClassification", c.primary_category || "Uncategorized", "ok");
+  const c = stages.classification;
+  setStatus("reportClassification", c ? (c.primary_category || "Uncategorized") : "Not run", c ? "ok" : "warn");
   const tagsEl = document.getElementById("reportClassBreakdown");
   tagsEl.innerHTML = "";
-  Object.entries(c.category_breakdown || {}).forEach(([cat, count]) => {
+  Object.entries(c?.category_breakdown || {}).forEach(([cat, count]) => {
     const tag = document.createElement("span");
     tag.className = "tag-cat";
     tag.textContent = `${cat} × ${count}`;
     tagsEl.appendChild(tag);
   });
 
-  const r = report.stages?.risk || {};
-  setStatus("reportRisk", `${capitalize(r.tier || "—")} (score ${r.score ?? "—"})`, r.tier === "high" ? "flagged" : r.tier === "medium" ? "warn" : "ok");
-  fillList("reportRiskReasons", r.reasons || []);
-
-  // explanation
-  const explanationSection = document.getElementById("reportExplanationSection");
-  const explanationText = document.getElementById("reportExplanation");
-
-  if (report.explanation) {
-    explanationSection.hidden = false;
-    explanationText.textContent = report.explanation;
+  const r = stages.risk;
+  if (r) {
+    setStatus("reportRisk", `${capitalize(r.tier || "—")} (score ${r.score ?? "—"})`,
+      r.tier === "high" ? "flagged" : r.tier === "medium" ? "warn" : "ok");
+    fillList("reportRiskReasons", r.reasons || []);
   } else {
-    explanationSection.hidden = true;
+    setStatus("reportRisk", "Not run", "warn");
+    fillList("reportRiskReasons", []);
   }
 
-  const a = report.stages?.approval || {};
-  setStatus("reportApproval", a.decision === "auto_approved" ? "Auto-approved" : `Sent to ${a.approver || "review"}`, a.decision === "auto_approved" ? "ok" : "warn");
+  const explanationSection = document.getElementById("reportExplanationSection");
+  explanationSection.hidden = !report.explanation;
+  document.getElementById("reportExplanation").textContent = report.explanation || "";
 
-  setupDecisionButtons(report, currentRunId);
+  const a = stages.approval;
+  if (a) {
+    const label = {
+      auto_approved: ["Auto-approved", "ok"],
+      approved: [`Approved by reviewer${a.note ? ` — “${a.note}”` : ""}`, "ok"],
+      rejected: [`Rejected by reviewer${a.note ? ` — “${a.note}”` : ""}`, "flagged"],
+    }[a.decision] || [`Sent to ${a.approver || a.routed_to || "review"}`, "warn"];
+    setStatus("reportApproval", label[0], label[1]);
+  } else {
+    setStatus("reportApproval", "Not run", "warn");
+  }
 
+  setupReportDecision(run, runStatus);
   showView("report");
-  loadHistory(); // refresh sidebar so the just-completed run appears
+}
+
+function headlineDecision(report, runStatus) {
+  if (STOP_LABELS[report.outcome]) return { text: STOP_LABELS[report.outcome], cls: "rejected" };
+  if (STOP_LABELS[runStatus]) return { text: STOP_LABELS[runStatus], cls: "rejected" };
+  const a = report.stages?.approval || {};
+  if (a.decision === "auto_approved") return { text: "Auto-approved", cls: "approved" };
+  if (a.decision === "approved") return { text: "Approved by reviewer", cls: "approved" };
+  if (a.decision === "rejected") return { text: "Rejected by reviewer", cls: "rejected" };
+  return { text: `Needs review — ${a.approver || a.routed_to || "AP team"}`, cls: "review" };
 }
 
 function setStatus(id, text, cls) {
@@ -82,7 +115,10 @@ function fillList(id, items) {
   const el = document.getElementById(id);
   el.innerHTML = "";
   if (!items.length) {
-    el.innerHTML = `<li style="color: var(--ink-faint);">None</li>`;
+    const li = document.createElement("li");
+    li.style.color = "var(--ink-faint)";
+    li.textContent = "None";
+    el.appendChild(li);
     return;
   }
   items.forEach(item => {
@@ -93,64 +129,82 @@ function fillList(id, items) {
 }
 
 /* ============================================================
-   HUMAN REVIEW — Approve / Reject buttons
-   Only shown when the pipeline routed this run to "needs review".
+   HUMAN REVIEW
+   Two decision panels share one submit routine:
+     • pipeline view  (#decisionActions)        — right after a live run pauses
+     • report view    (#reportDecisionActions)  — for pending runs opened from history
    ============================================================ */
-function setupDecisionButtons(report, runId) {
-  const actions = document.getElementById("decisionActions");
-  const resultText = document.getElementById("decisionResult");
-  const approveBtn = document.getElementById("approveBtn");
-  const rejectBtn = document.getElementById("rejectBtn");
+const decisionPanels = {
+  pipeline: {
+    actions: () => document.getElementById("decisionActions"),
+    note: () => document.getElementById("reviewerNote"),
+    result: () => document.getElementById("decisionResult"),
+    approve: () => document.getElementById("approveBtn"),
+    reject: () => document.getElementById("rejectBtn"),
+  },
+  report: {
+    actions: () => document.getElementById("reportDecisionActions"),
+    note: () => document.getElementById("reportReviewerNote"),
+    result: () => document.getElementById("reportDecisionResult"),
+    approve: () => document.getElementById("reportApproveBtn"),
+    reject: () => document.getElementById("reportRejectBtn"),
+  },
+};
 
-   if (!runId || !currentThreadId) {
-      resultEl.textContent = `Error: missing run_id (${runId}) or thread_id (${currentThreadId})`;
-      return;
-    }
-  resultText.textContent = "";
-  document.getElementById("reviewerNote").value = ""; 
-
-  const needsReview = report?.stages?.approval?.decision !== "auto_approved";
-  actions.hidden = !needsReview || !runId;
-
-  approveBtn.onclick = () => submitDecision(runId, "approved", actions, resultText);
-  rejectBtn.onclick = () => submitDecision(runId, "rejected", actions, resultText);
+function bindDecisionPanel(panelName, runId) {
+  const p = decisionPanels[panelName];
+  p.note().value = "";
+  p.result().textContent = "";
+  p.actions().hidden = false;
+  p.approve().disabled = false;
+  p.reject().disabled = false;
+  p.approve().onclick = () => submitDecision(runId, "approved", panelName);
+  p.reject().onclick = () => submitDecision(runId, "rejected", panelName);
 }
 
-async function submitDecision(runId, decision, actionsEl, resultEl) {
-  const noteEl = document.getElementById("reviewerNote");
-  const note = noteEl.value.trim() || null;
+function hideDecisionPanel(panelName) {
+  const p = decisionPanels[panelName];
+  p.actions().hidden = true;
+  p.result().textContent = "";
+}
+
+function showPipelineDecision(runId) { bindDecisionPanel("pipeline", runId); }
+function hidePipelineDecision() { hideDecisionPanel("pipeline"); }
+
+function setupReportDecision(run, runStatus) {
+  const pending = run?.id && (run.can_resume || runStatus === "pending_review");
+  if (pending) bindDecisionPanel("report", run.id);
+  else hideDecisionPanel("report");
+}
+
+async function submitDecision(runId, decision, panelName) {
+  const p = decisionPanels[panelName];
+  if (!runId) {
+    p.result().textContent = "Error: no run selected.";
+    return;
+  }
+  const note = p.note().value.trim();
+  p.approve().disabled = true;
+  p.reject().disabled = true;
+  p.result().textContent = "Submitting decision…";
 
   try {
-    const params = new URLSearchParams({
-      decision: decision,
-      thread_id: currentThreadId,
-    });
-
-    if (note) {
-      params.set("note", note);
-    }
-
-    const res = await authFetch(
-      `/api/runs/${runId}/resume?${params.toString()}`,
-      { method: "POST" }
-    );
-
+    const params = new URLSearchParams({ decision });
+    if (note) params.set("note", note);
+    const res = await authFetch(`/api/runs/${runId}/resume?${params.toString()}`, { method: "POST" });
     if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || "Could not resume pipeline.");
+      let detail = "Could not resume pipeline.";
+      try { detail = (await res.json()).detail || detail; } catch { /* not JSON */ }
+      throw new Error(detail);
     }
-
     const data = await res.json();
-
-    actionsEl.hidden = true;
-    resultEl.textContent = `Decision recorded: ${decision}`;
-
+    hideDecisionPanel(panelName);
     currentRunId = data.run_id;
-
-    renderReport(data.report, data.status);
+    renderReport(data.report, data.status, { id: data.run_id, status: data.status, human_decision: decision });
     loadHistory();
-
   } catch (err) {
-    resultEl.textContent = `Error: ${err.message}`;
+    p.result().textContent = `Error: ${err.message}`;
+    p.approve().disabled = false;
+    p.reject().disabled = false;
   }
 }

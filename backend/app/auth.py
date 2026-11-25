@@ -8,19 +8,30 @@ Flow:
      decode it to get the current user_id.
 """
 
+import logging
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
-# In production, set this via environment variable — never hardcode.
-SECRET_KEY = os.getenv("JWT_SECRET", "dev-only-secret-change-this-in-production")
+load_dotenv()  # don't rely on another module having loaded .env first
+logger = logging.getLogger(__name__)
+
+SECRET_KEY = os.getenv("JWT_SECRET")
+if not SECRET_KEY:
+    # Never fall back to a guessable constant. A random per-process secret is
+    # secure but invalidates all tokens on restart — set JWT_SECRET to persist them.
+    SECRET_KEY = secrets.token_urlsafe(64)
+    logger.warning("JWT_SECRET is not set; using a random per-process secret (tokens reset on restart).")
+
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", str(60 * 24)))  # default 1 day
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -42,8 +53,7 @@ def create_access_token(user_id: int, email: str) -> str:
 
 def decode_access_token(token: str) -> Optional[dict]:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except JWTError:
         return None
 
@@ -51,7 +61,7 @@ def decode_access_token(token: str) -> Optional[dict]:
 def get_current_user_id(token: str = Depends(oauth2_scheme)) -> int:
     """FastAPI dependency — inject this into any route that requires login."""
     payload = decode_access_token(token)
-    if payload is None:
+    if payload is None or "sub" not in payload:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",

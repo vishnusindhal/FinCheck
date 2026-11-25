@@ -1,20 +1,26 @@
 /* ============================================================
    PIPELINE — upload form, SSE stream consumption, live stage list
-   Depends on: authFetch (auth.js), showView/els (main.js), renderReport (report.js)
+   Depends on: authFetch (auth.js), showView/els (main.js),
+               renderReport/showPipelineDecision (report.js)
    ============================================================ */
 
-let extractionCompletedCount = 0;
+const EXTRACTION_NODES = ["extract_Invoice", "extract_PurchaseOrder", "extract_GoodReceipt"];
 const NODE_SEQUENCE = [
   { key: "extraction", label: "Extracting document fields" },
   { key: "validation", label: "Validating extracted data" },
   { key: "duplicate_detect", label: "Checking for duplicates" },
   { key: "3_way_matching", label: "Matching invoice against PO/GR" },
   { key: "classify", label: "Classifying expense category" },
-  {key: "anomaly_detect",  label: "Detecting Invoice Based on History"},
+  { key: "anomaly_detect", label: "Detecting anomalies from history" },
   { key: "risk_analysis", label: "Assessing risk" },
   { key: "approval", label: "Routing for approval" },
   { key: "report_gen", label: "Generating report" },
 ];
+
+// Per-run extraction bookkeeping (reset on every submit)
+let extractionExpected = 1;
+let extractionCompleted = 0;
+let extractionSummary = "";
 
 /* ============================================================
    DROPZONE FILE LABELS
@@ -57,22 +63,21 @@ els.uploadForm.addEventListener("submit", async (e) => {
   if (poFile) formData.append("po", poFile);
   if (grFile) formData.append("gr", grFile);
 
-  buildStageList();
-  els.pipelineTitle.textContent = `Processing ${invoiceFile.name}`;
+  extractionExpected = 1 + (poFile ? 1 : 0) + (grFile ? 1 : 0);
+  extractionCompleted = 0;
+  extractionSummary = "";
+
+  resetPipelineView(`Processing ${invoiceFile.name}`);
   showView("pipeline");
 
   try {
-    const response = await authFetch("/api/process", {
-      method: "POST",
-      body: formData,
-    });
-
+    const response = await authFetch("/api/process", { method: "POST", body: formData });
     if (!response.ok || !response.body) {
-      throw new Error(`Server responded ${response.status}`);
+      let detail = `Server responded ${response.status}`;
+      try { detail = (await response.json()).detail || detail; } catch { /* not JSON */ }
+      throw new Error(detail);
     }
-
     await consumeStream(response.body);
-
   } catch (err) {
     markPipelineError(err.message);
   } finally {
@@ -80,6 +85,15 @@ els.uploadForm.addEventListener("submit", async (e) => {
     els.submitBtn.textContent = "Run pipeline";
   }
 });
+
+function resetPipelineView(title) {
+  els.pipelineTitle.textContent = title;
+  els.pipelineSub.textContent = "Each stage runs in sequence — watch the ledger stamp as it goes.";
+  els.pipelineError.hidden = true;
+  els.pipelineError.textContent = "";
+  hidePipelineDecision();
+  buildStageList();
+}
 
 function buildStageList() {
   els.stageList.innerHTML = "";
@@ -92,7 +106,7 @@ function buildStageList() {
         <span class="stage-num">${String(i + 1).padStart(2, "0")}</span>
         <span class="stage-stamp">✓</span>
         <span class="stage-body">
-          <span class="stage-label">${node.label}</span>
+          <span class="stage-label">${escapeHtml(node.label)}</span>
           <span class="stage-detail"></span>
         </span>
       </div>
@@ -104,11 +118,9 @@ function buildStageList() {
 
 function markPipelineError(message) {
   els.pipelineTitle.textContent = "Pipeline stopped";
-  const note = document.createElement("p");
-  note.className = "view-sub";
-  note.style.color = "var(--rust)";
-  note.textContent = message;
-  els.stageList.before(note);
+  els.pipelineError.textContent = message;
+  els.pipelineError.hidden = false;
+  document.querySelectorAll(".stage-row.active").forEach(r => r.classList.remove("active"));
 }
 
 /* Parses a fetch ReadableStream as Server-Sent Events and dispatches each. */
@@ -117,56 +129,52 @@ async function consumeStream(body) {
   const decoder = new TextDecoder();
   let buffer = "";
 
+  const dispatch = (raw) => {
+    if (!raw.trim()) return;
+    const eventMatch = raw.match(/^event: (.+)$/m);
+    const dataLines = raw.split("\n").filter(l => l.startsWith("data: ")).map(l => l.slice(6));
+    if (!eventMatch || !dataLines.length) return;
+    handleStreamEvent(eventMatch[1].trim(), JSON.parse(dataLines.join("\n")));
+  };
+
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-
     const events = buffer.split("\n\n");
     buffer = events.pop(); // last chunk may be incomplete — keep for next read
-
-    for (const raw of events) {
-      if (!raw.trim()) continue;
-      const eventMatch = raw.match(/^event: (.+)$/m);
-      const dataMatch = raw.match(/^data: (.+)$/m);
-      if (!eventMatch || !dataMatch) continue;
-
-      const eventName = eventMatch[1].trim();
-      const data = JSON.parse(dataMatch[1]);
-      handleStreamEvent(eventName, data);
-    }
+    events.forEach(dispatch);
   }
+  buffer += decoder.decode();
+  dispatch(buffer);
 }
 
 function handleStreamEvent(eventName, data) {
-  // Remap the three fan-out extraction nodes to the single "extraction" UI row
-  const EXTRACTION_NODES = ["extract_Invoice", "extract_PurchaseOrder", "extract_GoodReceipt"];
-
+  // The fan-out extraction nodes share the single "extraction" UI row
   if (EXTRACTION_NODES.includes(data.node)) {
-    if (eventName === "node_start") {
-      // Only activate the row on the first one to fire
-      const row = document.getElementById("stage-extraction");
-      if (row) row.classList.add("active");
-    }
+    const row = document.getElementById("stage-extraction");
+    if (!row) return;
+    if (eventName === "node_start") row.classList.add("active");
     if (eventName === "node_complete") {
-      extractionCompletedCount++;
-      if (extractionCompletedCount >= 3) {
-        // All three done — mark the row complete
-        const row = document.getElementById("stage-extraction");
-        if (row) {
-          row.classList.remove("active");
-          row.classList.add("complete");
-          const detail = row.querySelector(".stage-detail");
-          if (detail) detail.textContent = "invoice, PO and GR extracted";
-        }
-        extractionCompletedCount = 0; // reset for next run
+      extractionCompleted++;
+      if (data.node === "extract_Invoice" && data.state_delta?.invoice) {
+        const inv = data.state_delta.invoice;
+        extractionSummary = `${inv.invoice_number || "unknown"} — ${inv.vendor_name || "unknown vendor"}`;
+      }
+      if (extractionCompleted >= extractionExpected) {
+        row.classList.remove("active");
+        row.classList.add("complete");
+        const docs = extractionExpected === 3 ? "invoice, PO and GR" : extractionExpected === 2 ? "2 documents" : "invoice";
+        row.querySelector(".stage-detail").textContent = extractionSummary || `${docs} extracted`;
       }
     }
-    return; // don't fall through to the normal handler
+    return;
   }
+
   if (eventName === "node_start") {
     const row = document.getElementById(`stage-${data.node}`);
     if (row) row.classList.add("active");
+    return;
   }
 
   if (eventName === "node_complete") {
@@ -183,46 +191,33 @@ function handleStreamEvent(eventName, data) {
     }
     detail.textContent = summary.text;
 
-    // Attach expandable logs if this node produced any
     const logs = extractStageLogs(data.node, data.state_delta);
-    if (logs.length) {
-      attachStageLogs(row, logs);
-    }
+    if (logs.length) attachStageLogs(row, logs);
+    return;
   }
+
   if (eventName === "interrupted") {
-    currentRunId    = data.run_id;
+    currentRunId = data.run_id;
     currentThreadId = data.thread_id;
 
-    // Mark approval row as "waiting"
     const approvalRow = document.getElementById("stage-approval");
     if (approvalRow) {
       approvalRow.classList.remove("active");
       approvalRow.classList.add("interrupted");
-      const detail = approvalRow.querySelector(".stage-detail");
-      if (detail) detail.textContent = "waiting for your decision";
+      approvalRow.querySelector(".stage-detail").textContent = "waiting for your decision";
     }
-
-    // Update header so it doesn't look frozen
     els.pipelineTitle.textContent = "Review required";
-    document.getElementById("pipelineSub").textContent =
-      "The pipeline has paused for human review. Approve or reject to continue.";
-
-    // Show buttons
-    const actions  = document.getElementById("decisionActions");
-    const resultEl = document.getElementById("decisionResult");
-    const approveBtn = document.getElementById("approveBtn");
-    const rejectBtn  = document.getElementById("rejectBtn");
-
-    actions.hidden = false;
-
-    approveBtn.onclick = () => submitDecision(currentRunId, "approved", actions, resultEl);
-    rejectBtn.onclick  = () => submitDecision(currentRunId, "rejected", actions, resultEl);
-
+    els.pipelineSub.textContent = "The pipeline has paused for human review. Approve or reject to continue.";
+    showPipelineDecision(data.run_id);
+    loadHistory(); // the pending run now appears in the sidebar
     return;
   }
+
   if (eventName === "done") {
     currentRunId = data.run_id;
-    setTimeout(() => renderReport(data.report, data.status), 500);
+    currentThreadId = data.thread_id;
+    setTimeout(() => renderReport(data.report, data.status, { id: data.run_id, status: data.status }), 500);
+    return;
   }
 
   if (eventName === "error") {
@@ -232,17 +227,16 @@ function handleStreamEvent(eventName, data) {
 
 function extractStageLogs(node, delta) {
   if (!delta) return [];
-  // Pull logs from wherever this node stores them in state
-  if (node === "anomaly_detect") {
-    return delta.anomaly_result?.logs || [];
-  }
-  if (node === "risk_analysis") {
-    return delta.risk?.reasons || [];
-  }
+  if (node === "anomaly_detect") return delta.anomaly_result?.logs || [];
+  if (node === "risk_analysis") return delta.risk?.reasons || [];
   if (node === "3_way_matching") {
     return (delta.match_result?.issues || []).map(
       i => `${i.field}: expected ${i.expected}, got ${i.actual} [${i.severity}]`
     );
+  }
+  if (node === "validation") return delta.validation_errors || [];
+  if (node === "duplicate_detect") {
+    return (delta.warnings || []).flatMap(w => Object.entries(w).map(([k, v]) => `${k}: ${v}`));
   }
   return [];
 }
@@ -250,38 +244,34 @@ function extractStageLogs(node, delta) {
 function attachStageLogs(row, logs) {
   const logsDiv = row.querySelector(".stage-logs");
   if (!logsDiv) return;
-
+  logsDiv.innerHTML = "";
   logs.forEach(log => {
     const p = document.createElement("p");
     p.className = "stage-log-line";
     p.textContent = log;
     logsDiv.appendChild(p);
   });
-
-  logsDiv.hidden = false; // show once logs exist
+  logsDiv.hidden = false;
   row.classList.add("has-logs");
-
-  // Click the main row area to toggle logs open/closed
-  row.querySelector(".stage-row-main").addEventListener("click", () => {
+  row.querySelector(".stage-row-main").onclick = () => {
     logsDiv.hidden = !logsDiv.hidden;
     row.classList.toggle("logs-open", !logsDiv.hidden);
-  });
+  };
 }
 
-/* Produces a one-line human summary for each node's result, shown under the stage label. */
+/* One-line human summary for each node's result, shown under the stage label. */
 function summarizeStageDelta(node, delta) {
   if (!delta) return { text: "", flagged: false };
 
   switch (node) {
-    case "extraction":
-      return { text: delta.invoice ? `${delta.invoice.invoice_number || "unknown"} — ${delta.invoice.vendor_name || "unknown vendor"}` : "extracted", flagged: false };
     case "validation":
       return delta.is_valid
         ? { text: "all required fields present", flagged: false }
         : { text: `${(delta.validation_errors || []).length} issue(s) found`, flagged: true };
     case "duplicate_detect":
-      return delta.is_duplicate
-        ? { text: "already exists in the ledger", flagged: true }
+      if (delta.is_duplicate) return { text: "already exists in the ledger", flagged: true };
+      return (delta.warnings || []).length
+        ? { text: `no prior invoice · ${delta.warnings.length} warning(s)`, flagged: false }
         : { text: "no prior record found", flagged: false };
     case "3_way_matching":
       return delta.match_result?.matched
@@ -289,10 +279,20 @@ function summarizeStageDelta(node, delta) {
         : { text: `${(delta.match_result?.issues || []).length} mismatch(es)`, flagged: true };
     case "classify":
       return { text: delta.classification?.primary_category || "uncategorized", flagged: false };
+    case "anomaly_detect": {
+      const a = delta.anomaly_result || {};
+      if (a.model_used === "none") return { text: "skipped — no model trained yet", flagged: false };
+      return a.is_anomaly ? { text: "unusual for this vendor", flagged: true } : { text: "looks normal", flagged: false };
+    }
     case "risk_analysis":
       return { text: `${delta.risk?.tier || "—"} risk (score ${delta.risk?.score ?? "—"})`, flagged: delta.risk?.tier === "high" };
-    case "approval":
-      return { text: delta.approval?.decision === "auto_approved" ? "auto-approved" : `routed to ${delta.approval?.approver || "review"}`, flagged: delta.approval?.decision !== "auto_approved" };
+    case "approval": {
+      const d = delta.approval?.decision;
+      if (d === "auto_approved") return { text: "auto-approved", flagged: false };
+      if (d === "approved") return { text: "approved by reviewer", flagged: false };
+      if (d === "rejected") return { text: "rejected by reviewer", flagged: true };
+      return { text: `routed to ${delta.approval?.approver || "review"}`, flagged: true };
+    }
     case "report_gen":
       return { text: "report compiled", flagged: false };
     default:

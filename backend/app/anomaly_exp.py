@@ -1,15 +1,16 @@
-import os
+"""
+Gemini-written one-sentence risk explanation for a report.
+(The module name is historical; it explains overall risk signals, not only anomalies.)
+"""
+
 import json
-from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
+import logging
 
-load_dotenv()
+from backend.app.extracter import get_llm
 
-_llm = ChatGoogleGenerativeAI(
-    model=os.getenv("MODEL_NAME", "gemini-2.5-flash"),
-    api_key=os.getenv("API_KEY", "")
-)
+logger = logging.getLogger(__name__)
 
+FALLBACK_TEXT = "Flagged due to multiple risk indicators."
 
 SYSTEM_PROMPT = """
 You are an invoice risk explanation engine.
@@ -18,16 +19,15 @@ Your task:
 - Generate ONE short explanation sentence.
 - Use ONLY the provided context.
 - Do NOT invent facts.
-- Do NOT mention missing fields.
+- Do NOT mention missing fields unless they appear in the signals.
 - Keep response under 35 words.
 - Sound like an audit assistant, not a chatbot.
 
 Examples:
 Input:
 {
-  "validation_error": ["GST number missing"],
-  "warnings": [],
-  "is_duplicate": false
+  "risk_level": "medium",
+  "signals": ["Validation error: GST number missing"]
 }
 
 Output:
@@ -35,12 +35,8 @@ Output:
 
 Input:
 {
-  "match_result": {
-      "vendor_new": true,
-      "amount_deviation_percent": 62
-  },
-  "warnings": ["High amount variance"],
-  "is_duplicate": false
+  "risk_level": "high",
+  "signals": ["New/unseen vendor", "Amount 50%+ above vendor average"]
 }
 
 Output:
@@ -49,63 +45,24 @@ Output:
 
 
 def explanation(context: dict, max_retries: int = 3) -> str:
-    """
-    Generate a short plain-English explanation
-    from structured invoice risk signals.
-    """
-
-    payload = json.dumps(context, indent=2)
-
+    """Generate a short plain-English explanation from structured invoice risk signals."""
+    payload = json.dumps(context, indent=2, default=str)
+    messages = [
+        ("system", SYSTEM_PROMPT),
+        ("human", f"Generate explanation from this context:\n\n{payload}"),
+    ]
     for attempt in range(1, max_retries + 1):
         try:
-            messages = [
-                ("system", SYSTEM_PROMPT),
-                (
-                    "human",
-                    f"Generate explanation from this context:\n\n{payload}"
-                )
-            ]
+            response = get_llm().invoke(messages)
+            content = response.content
+            if isinstance(content, list):  # some models return content blocks
+                content = " ".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in content)
+            text = str(content).strip().replace("\n", " ")
+            return text[:250] if text else FALLBACK_TEXT
+        except Exception as exc:
+            logger.warning("Explanation attempt %d/%d failed: %s", attempt, max_retries, exc)
+    return FALLBACK_TEXT
 
-            response = _llm.invoke(messages)
 
-            text = response.content.strip()
-
-            # tiny cleanup guard
-            text = text.replace("\n", " ")
-
-            if len(text) > 250:
-                text = text[:250]
-
-            return text
-
-        except Exception as e:
-            if attempt == max_retries:
-                return "Flagged due to multiple risk indicators."
-
-    return "Flagged due to multiple risk indicators."
-
-if __name__ == '__main__':
-    context = {
-        "validation": {
-            "errors": [
-                "GST number missing"
-            ],
-        },
-
-        "matching": {
-            "is_duplicate": False,
-            "vendor_new": True,
-            "po_match_confidence": 0.42,
-            "amount_deviation_percent": 61
-        },
-
-        "risk": {
-            "score": 0.87,
-            "level": "high"
-        },
-
-        "pipeline_warnings": [
-            "High amount variance compared to category baseline"
-        ]
-    }
-    print(explanation(context))
+if __name__ == "__main__":
+    print(explanation({"risk_level": "high", "risk_score": 55, "signals": ["New/unseen vendor"]}))

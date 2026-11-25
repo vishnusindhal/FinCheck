@@ -58,7 +58,7 @@ The workflow streams execution progress to the frontend in real time, so users c
 ---
 
 ## Evaluation
-FinCheck currently includes a manually curated benchmark of 15 invoices covering extraction, 3-way matching, and mismatch detection.
+FinCheck was evaluated on a manually curated benchmark of 15 invoices covering extraction, 3-way matching, and mismatch detection. The benchmark data and notebooks are kept outside this repository, so the figures below cannot be reproduced from the code here.
 
 | Metric | Result |
 |---|---|
@@ -80,9 +80,11 @@ FinCheck does not force every vendor through the same anomaly detector.
 
 The system selects a strategy based on the available historical data:
 
-- Vendor-specific Isolation Forest when sufficient history exists
-- Statistical profiling for vendors with limited history
-- Global fallback rules for new vendors
+- Vendor-specific Isolation Forest when a vendor has at least 5 invoices
+- A global Isolation Forest fallback for vendors with less history
+- Skipped (no penalty) until at least 5 invoices exist in total
+
+Inference features are computed against the vendor's stored history, and models retrain in the background after each completed run.
 
 This allows anomaly detection to become more specific as vendor history accumulates.
 
@@ -112,7 +114,7 @@ In FinCheck 1.4, the human review gate is implemented using LangGraph's `interru
 2. Full pipeline state is persisted to PostgreSQL via `PostgresSaver`
 3. The frontend receives an `interrupted` SSE event with the `run_id` and `thread_id`
 4. The reviewer sees the pipeline paused mid-run with Approve / Reject controls
-5. On decision, `POST /api/runs/{run_id}/resume` is called with the decision and thread_id
+5. On decision, `POST /api/runs/{run_id}/resume?decision=approved|rejected` is called; the server verifies the run belongs to the user and is still pending, then looks up its `thread_id` itself — so a pending review can be completed later from the history sidebar, even after a page reload or server restart
 6. LangGraph resumes the graph from the checkpoint — report generation runs with the human decision in state
 
 Reviewer decisions are stored and can be used as historical context for future risk assessment. The system treats automation as a decision-support layer rather than blindly approving invoices.
@@ -171,39 +173,51 @@ The workflow is orchestrated with LangGraph and exposed through FastAPI. Executi
 | State Persistence | LangGraph PostgresSaver + Supabase |
 | LLM | Gemini 2.5 Flash |
 | Backend | FastAPI |
-| Database | Supabase PostgreSQL |
+| Database | PostgreSQL (e.g. Supabase) |
 | ML | Scikit-learn |
 | Streaming | Server-Sent Events |
 | Authentication | JWT + bcrypt |
 | Frontend | HTML / CSS / JavaScript |
-| Deployment | Vercel + Hugging Face Spaces |
+| Deployment | Hugging Face Spaces (Docker: API + UI at `/ui/`); optional separate static frontend |
 
 ---
 
 ## Local Development
 
-### Backend
+Run everything from the project root (imports are `backend.app.*`):
+
 ```bash
-cd backend
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+python -m venv .venv
+.venv/Scripts/activate          # Windows;  macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt  # add -r requirements-dev.txt for tests
+python -m uvicorn backend.app.main:app --reload --port 8000
 ```
 
-Configure environment variables:
+Create `.env` in the project root:
 ```
 API_KEY=your_gemini_api_key
 MODEL_NAME=gemini-2.5-flash
-DB_URL=your_supabase_postgres_url
-JWT_SECRET=your_secret
+DB_URL=postgresql://USER:PASSWORD@HOST:PORT/DBNAME
+JWT_SECRET=a_long_random_secret
 ```
+Optional: `CORS_ORIGINS`, `AUTO_APPROVE_LIMIT`, `DIRECTOR_REVIEW_LIMIT`, `JWT_EXPIRE_MINUTES`, `MAX_UPLOAD_MB`, `AUTO_INIT_DB`, `EMAIL_CHECK_DELIVERABILITY`, `MODELS_DIR` (see `PROJECT_KNOWLEDGE/CONFIGURATION.md`).
+
+Database tables are created/upgraded automatically at startup (`AUTO_INIT_DB=true` by default).
 
 ### Frontend
+The backend serves the UI at http://localhost:8000/ui/. Alternatively:
 ```bash
 cd frontend
-python -m http.server 5500
+python -m http.server 5500      # then open http://localhost:5500 (talks to http://127.0.0.1:8000)
 ```
+For a separately hosted frontend, set `window.FINCHECK_API_BASE` before `js/config.js` loads.
 
-Then open: http://localhost:5500
+### Tests
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+Tests run offline (Gemini and PostgreSQL are faked).
 
 ---
 

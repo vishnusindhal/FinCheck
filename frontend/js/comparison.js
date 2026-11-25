@@ -1,294 +1,182 @@
 /* ============================================================
-   DOCUMENT COMPARISON
+   DOCUMENT COMPARISON — invoice vs purchase order vs goods receipt
+   Depends on: authFetch (auth.js), currentInvoice (invoices.js),
+               els (main.js), formatCurrency/formatDate/escapeHtml (utils.js)
+
+   Mismatch highlighting uses the issue `field` formats produced by
+   backend/app/matching.py (lower-cased here):
+     gr:<desc> | gr:qty:<desc> | invoice:<desc> | invoice:price:<desc>
+     invoice:price_low:<desc> | invoice:qty:<desc> | total_amount
    ============================================================ */
 
-let comparisonState = {
-    invoice: null,
-    purchaseOrder: null,
-    goodsReceipt: null,
-    mismatches: null
-};
-
-/* ============================================================
-   LOAD COMPARISON DATA
-   ============================================================ */
+let comparisonState = { invoice: null, purchaseOrder: null, goodsReceipt: null, mismatches: null };
 
 async function loadComparison(invoice) {
+  comparisonState = { invoice, purchaseOrder: null, goodsReceipt: null, mismatches: null };
+  const po = encodeURIComponent(invoice.po_number || "");
 
-    // Reset state every time a new comparison is opened
-    comparisonState = {
-        invoice,
-        purchaseOrder: null,
-        goodsReceipt: null,
-        mismatches: null
-    };
+  const requests = [
+    authFetch(`/api/purchase_orders/${po}`),
+    authFetch(`/api/goods_receipts/${po}`),
+    invoice.run_id ? authFetch(`/api/runs/${invoice.run_id}/mismatches`) : Promise.resolve(null),
+  ];
+  const [poRes, grRes, mismatchRes] = await Promise.allSettled(requests);
+  const json = async (r) => (r.status === "fulfilled" && r.value && r.value.ok ? r.value.json() : null);
 
-    try {
-        const [poRes, grRes, mismatchRes] = await Promise.all([
-            authFetch(`/api/purchase_orders/${invoice.po_number}`),
-            authFetch(`/api/goods_receipts/${invoice.po_number}`),
-            authFetch(`/api/runs/${invoice.run_id}/mismatches`)
-        ]);
-
-        comparisonState.purchaseOrder =
-            poRes.ok ? await poRes.json() : null;
-
-        comparisonState.goodsReceipt =
-            grRes.ok ? await grRes.json() : null;
-
-        comparisonState.mismatches =
-            mismatchRes.ok ? await mismatchRes.json() : null;
-
-        console.log("Comparison State:", comparisonState);
-
-    } catch (err) {
-        console.error("Comparison load failed:", err);
-    }
+  comparisonState.purchaseOrder = await json(poRes);
+  comparisonState.goodsReceipt = await json(grRes);
+  comparisonState.mismatches = await json(mismatchRes);
 }
 
-/* ============================================================
-   RENDER
-   ============================================================ */
+function itemKey(item) {
+  return (item?.description || "").toLowerCase().trim();
+}
 
-function renderLineItemComparison() {
+function toMap(items) {
+  return Object.fromEntries((items || []).filter(i => i.description).map(i => [itemKey(i), i]));
+}
 
-    const invoice = comparisonState.invoice;
-    const po = comparisonState.purchaseOrder;
-    const gr = comparisonState.goodsReceipt;
-
-        // Build lookup for mismatches
-    const mismatchLookup = new Set();
-
-    (comparisonState.mismatches?.issues || []).forEach(issue => {
-        mismatchLookup.add(issue.field.toLowerCase());
-    });
-
-    const invoiceMap = Object.fromEntries(
-        (invoice.line_items || []).map(item => [
-            item.description.toLowerCase(),
-            item
-        ])
-    );
-
-    const poMap = Object.fromEntries(
-        (po.line_items || []).map(item => [
-            item.description.toLowerCase(),
-            item
-        ])
-    );
-
-    const grMap = Object.fromEntries(
-        (gr.line_items || []).map(item => [
-            item.description.toLowerCase(),
-            item
-        ])
-    );
-
-    const descriptions = new Set([
-        ...Object.keys(invoiceMap),
-        ...Object.keys(poMap),
-        ...Object.keys(grMap)
-    ]);
-
-    let html = `
-        <h3>Line Item Comparison</h3>
-
-        <table class="comparison-table">
-            <thead>
-                <tr>
-                    <th>Description</th>
-                    <th>Invoice Qty</th>
-                    <th>PO Qty</th>
-                    <th>GR Qty</th>
-                    <th>Invoice Price</th>
-                    <th>PO Price</th>
-                    <th>Status</th>
-                </tr>
-            </thead>
-            <tbody>
-    `;
-    descriptions.forEach(desc => {
-
-        const inv = invoiceMap[desc];
-        const poItem = poMap[desc];
-        const grItem = grMap[desc];
-
-    // ---------- Highlight logic ----------
-        const qtyMismatch = mismatchLookup.has(
-        `quantity:${desc}`
-        );
-
-        const priceMismatch = mismatchLookup.has(
-            `invoice:price:${desc}`
-        );
-
-        const status =
-            qtyMismatch || priceMismatch
-                ? "⚠ Mismatch"
-                : "✅ Match";
-
-
-    const invoicePriceClass = priceMismatch ? "mismatch-cell" : "";
-    const poPriceClass = priceMismatch ? "mismatch-cell" : "";
-
-    const invoiceQtyClass = qtyMismatch ? "mismatch-cell" : "";
-    const poQtyClass = qtyMismatch ? "mismatch-cell" : "";
-    const grQtyClass = qtyMismatch ? "mismatch-cell" : "";
-
-    html += `
-        <tr>
-
-            <td>${inv?.description || poItem?.description || grItem?.description}</td>
-
-            <td class="${invoiceQtyClass}">
-                ${inv?.quantity ?? "—"}
-            </td>
-
-            <td class="${poQtyClass}">
-                ${poItem?.quantity ?? "—"}
-            </td>
-
-            <td class="${grQtyClass}">
-                ${grItem?.quantity ?? "—"}
-            </td>
-
-            <td class="${invoicePriceClass}">
-                ${priceMismatch ? "⚠ " : ""}
-                ${inv?.unit_price ?? "—"}
-            </td>
-
-            <td class="${poPriceClass}">
-                ${priceMismatch ? "⚠ " : ""}
-                ${poItem?.unit_price ?? "—"}
-            </td>
-
-            <td>${status}</td>
-
-        </tr>
-    `;
-});
-
-    html += `
-            </tbody>
-        </table>
-    `;
-
-    document.getElementById("comparisonLineItems").innerHTML = html;
+function renderComparisonMessage(message) {
+  document.getElementById("comparisonSummary").innerHTML =
+    `<p class="comparison-message">${escapeHtml(message)}</p>`;
+  document.getElementById("comparisonLineItems").innerHTML = "";
+  els.comparisonPanel.hidden = false;
 }
 
 function renderComparison() {
+  const { invoice, purchaseOrder: po, goodsReceipt: gr, mismatches } = comparisonState;
 
-    if (
-        !comparisonState.invoice ||
-        !comparisonState.purchaseOrder ||
-        !comparisonState.goodsReceipt ||
-        !comparisonState.mismatches
-    ) {
-        alert("Unable to load comparison data.");
-        return;
-    }
+  if (!invoice) return;
+  if (!po && !gr) {
+    renderComparisonMessage("No purchase order or goods receipt was found for this invoice's PO number.");
+    return;
+  }
 
-    document.getElementById("comparisonPanel").hidden = false;
-    const invoice = comparisonState.invoice;
-    const po = comparisonState.purchaseOrder;
-    const gr = comparisonState.goodsReceipt;
-    const totalMismatch =
-    comparisonState.mismatches.issues.some(
-        issue => issue.field.toLowerCase() === "total_amount"
-    );
+  const issueFields = new Set((mismatches?.issues || []).map(i => (i.field || "").toLowerCase()));
+  const totalMismatch = issueFields.has("total_amount");
+  const totalClass = totalMismatch ? "mismatch-cell" : "";
+  const poTotal = (po?.line_items || []).reduce(
+    (sum, item) => sum + Number(item.quantity || 0) * Number(item.unit_price || 0), 0);
 
-    const totalClass = totalMismatch ? "mismatch-cell" : "";
+  document.getElementById("comparisonSummary").innerHTML = `
+    ${mismatches ? "" : `<p class="comparison-message">Matching results are not available for this invoice; showing documents only.</p>`}
+    <table class="comparison-table">
+      <thead>
+        <tr><th>Field</th><th>Invoice</th><th>Purchase Order</th><th>Goods Receipt</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Vendor</td>
+          <td>${escapeHtml(invoice.vendor_name ?? "—")}</td>
+          <td>${escapeHtml(po?.vendor_name ?? "—")}</td>
+          <td>—</td>
+        </tr>
+        <tr>
+          <td>PO Number</td>
+          <td>${escapeHtml(invoice.po_number ?? "—")}</td>
+          <td>${escapeHtml(po?.po_number ?? "—")}</td>
+          <td>${escapeHtml(gr?.po_number ?? "—")}</td>
+        </tr>
+        <tr>
+          <td>Currency</td>
+          <td>${escapeHtml(invoice.currency ?? "—")}</td>
+          <td>${escapeHtml(po?.currency ?? "—")}</td>
+          <td>—</td>
+        </tr>
+        <tr>
+          <td>Total Amount</td>
+          <td class="${totalClass}">${totalMismatch ? "⚠ " : ""}${escapeHtml(formatCurrency(invoice.total_amount, invoice.currency))}</td>
+          <td class="${totalClass}">${totalMismatch ? "⚠ " : ""}${po ? escapeHtml(formatCurrency(poTotal, po.currency)) : "—"}<span class="comparison-note">${po ? " (pre-tax)" : ""}</span></td>
+          <td>—</td>
+        </tr>
+        <tr>
+          <td>Invoice Date</td>
+          <td>${escapeHtml(formatDate(invoice.invoice_date))}</td>
+          <td>—</td>
+          <td>—</td>
+        </tr>
+        <tr>
+          <td>Received Date</td>
+          <td>—</td>
+          <td>—</td>
+          <td>${escapeHtml(formatDate(gr?.received_date))}</td>
+        </tr>
+      </tbody>
+    </table>
+  `;
 
-    document.getElementById("comparisonSummary").innerHTML = `
-        <table class="comparison-table">
-            <thead>
-                <tr>
-                    <th>Field</th>
-                    <th>Invoice</th>
-                    <th>Purchase Order</th>
-                    <th>Goods Receipt</th>
-                </tr>
-            </thead>
-            <tbody>
-                <tr>
-                    <td>Vendor</td>
-                    <td>${invoice.vendor_name ?? "—"}</td>
-                    <td>${po.vendor_name ?? "—"}</td>
-                    <td>—</td>
-                </tr>
+  renderLineItemComparison(issueFields);
+  els.comparisonPanel.hidden = false;
+  els.comparisonPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
 
-                <tr>
-                    <td>PO Number</td>
-                    <td>${invoice.po_number ?? "—"}</td>
-                    <td>${po.po_number ?? "—"}</td>
-                    <td>${gr.po_number ?? "—"}</td>
-                </tr>
+function renderLineItemComparison(issueFields) {
+  const { invoice, purchaseOrder: po, goodsReceipt: gr } = comparisonState;
+  const invoiceMap = toMap(invoice.line_items);
+  const poMap = toMap(po?.line_items);
+  const grMap = toMap(gr?.line_items);
+  const descriptions = new Set([...Object.keys(invoiceMap), ...Object.keys(poMap), ...Object.keys(grMap)]);
 
-                <tr>
-                    <td>Currency</td>
-                    <td>${invoice.currency ?? "—"}</td>
-                    <td>${po.currency ?? "—"}</td>
-                    <td>—</td>
-                </tr>
+  let rows = "";
+  descriptions.forEach(desc => {
+    const inv = invoiceMap[desc];
+    const poItem = poMap[desc];
+    const grItem = grMap[desc];
 
-                <tr>
-                    <td>Total Amount</td>
+    const invQtyIssue = issueFields.has(`invoice:qty:${desc}`);
+    const grQtyIssue = issueFields.has(`gr:qty:${desc}`);
+    const priceIssue = issueFields.has(`invoice:price:${desc}`) || issueFields.has(`invoice:price_low:${desc}`);
+    const notOrdered = issueFields.has(`invoice:${desc}`);
+    const notReceived = issueFields.has(`gr:${desc}`);
+    const anyIssue = invQtyIssue || grQtyIssue || priceIssue || notOrdered || notReceived;
 
-                    <td class="${totalClass}">
-                        ${totalMismatch ? "⚠ " : ""}
-                        ${formatCurrency(invoice.total_amount, invoice.currency)}
-                    </td>
+    const cls = (flag) => (flag ? "mismatch-cell" : "");
+    const status = notOrdered ? "⚠ Not on PO" : notReceived ? "⚠ Not received" : anyIssue ? "⚠ Mismatch" : "✅ Match";
 
-                    <td class="${totalClass}">
-                        ${totalMismatch ? "⚠ " : ""}
-                        ${formatCurrency(
-                            po.line_items.reduce(
-                                (sum, item) => sum + item.quantity * item.unit_price,
-                                0
-                            ),
-                            po.currency
-                        )}
-                    </td>
-
-                    <td>—</td>
-                </tr>
-
-                <tr>
-                    <td>Invoice Date</td>
-                    <td>${formatDate(invoice.invoice_date)}</td>
-                    <td>—</td>
-                    <td>—</td>
-                </tr>
-
-                <tr>
-                    <td>Received Date</td>
-                    <td>—</td>
-                    <td>—</td>
-                    <td>${formatDate(gr.received_date)}</td>
-                </tr>
-            </tbody>
-        </table>
+    rows += `
+      <tr>
+        <td>${escapeHtml(inv?.description || poItem?.description || grItem?.description || desc)}</td>
+        <td class="${cls(invQtyIssue)}">${escapeHtml(inv?.quantity ?? "—")}</td>
+        <td class="${cls(grQtyIssue)}">${escapeHtml(poItem?.quantity ?? "—")}</td>
+        <td class="${cls(invQtyIssue || grQtyIssue || notReceived)}">${escapeHtml(grItem?.quantity ?? "—")}</td>
+        <td class="${cls(priceIssue)}">${priceIssue ? "⚠ " : ""}${escapeHtml(inv?.unit_price ?? "—")}</td>
+        <td class="${cls(priceIssue)}">${priceIssue ? "⚠ " : ""}${escapeHtml(poItem?.unit_price ?? "—")}</td>
+        <td>${status}</td>
+      </tr>
     `;
-    renderLineItemComparison();
+  });
+
+  document.getElementById("comparisonLineItems").innerHTML = `
+    <h3>Line Item Comparison</h3>
+    <table class="comparison-table">
+      <thead>
+        <tr>
+          <th>Description</th><th>Invoice Qty</th><th>PO Qty</th><th>GR Qty</th>
+          <th>Invoice Price</th><th>PO Price</th><th>Status</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
 }
 
 /* ============================================================
-   EVENTS
+   EVENTS (single handler — invoices.js no longer binds this button)
    ============================================================ */
+document.getElementById("compareDocumentsBtn").addEventListener("click", async () => {
+  if (!currentInvoice) return;
+  if (!currentInvoice.po_number) {
+    renderComparisonMessage("This invoice has no PO number, so there is nothing to compare against.");
+    return;
+  }
+  try {
+    await loadComparison(currentInvoice);
+    renderComparison();
+  } catch (err) {
+    renderComparisonMessage(`Unable to load comparison data: ${err.message}`);
+  }
+});
 
-const compareBtn = document.getElementById("compareDocumentsBtn");
-if (compareBtn) {
-    compareBtn.addEventListener("click", async () => {
-        if (!currentInvoice) return;
-        await loadComparison(currentInvoice);
-        renderComparison();
-    });
-
-}
-
-const closeBtn = document.getElementById("closeComparisonBtn");
-if (closeBtn) {
-    closeBtn.addEventListener("click", () => {
-        document.getElementById("comparisonPanel").hidden = true;
-    });
-}
+document.getElementById("closeComparisonBtn").addEventListener("click", () => {
+  els.comparisonPanel.hidden = true;
+});

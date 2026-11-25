@@ -4,7 +4,8 @@ Each row is one human decision on one invoice run — over time,
 this table becomes the basis for adaptive risk scoring per vendor.
 """
 
-from datetime import datetime, timezone
+import json
+
 from backend.app.db import get_connection
 
 
@@ -24,6 +25,10 @@ def create_reviewer_decisions_table():
             created_at TIMESTAMP DEFAULT NOW()
         )
     """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS reviewer_decisions_vendor_idx
+        ON reviewer_decisions (reviewer_id, vendor_name)
+    """)
     conn.commit()
     cur.close()
     conn.close()
@@ -40,7 +45,6 @@ def insert_reviewer_decision(
 ):
     conn = get_connection()
     cur = conn.cursor()
-    import json
     cur.execute(
         """INSERT INTO reviewer_decisions
            (invoice_id, reviewer_id, vendor_name, decision, risk_score_at_decision, risk_factors, reviewer_note)
@@ -48,33 +52,33 @@ def insert_reviewer_decision(
         (
             invoice_id,
             reviewer_id,
-            vendor_name.strip().lower(),
+            (vendor_name or "").strip().lower() or None,
             decision,
             risk_score_at_decision,
-            json.dumps(risk_factors),
+            json.dumps(risk_factors or []),
             reviewer_note,
-        )
+        ),
     )
     conn.commit()
     cur.close()
     conn.close()
 
 
-def get_vendor_decisions(vendor_name: str) -> list[dict]:
+def get_vendor_decisions(vendor_name: str, reviewer_id: int | None = None) -> list[dict]:
     """
-    Returns all past reviewer decisions for a given vendor.
-    Used by the risk agent to check: did reviewers historically
-    approve this vendor even when it was flagged?
+    Past reviewer decisions for a vendor, scoped to one user when reviewer_id is
+    given (so one user's reviews never influence another user's risk scores).
     """
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(
-        """SELECT decision, risk_score_at_decision, risk_factors, created_at
-           FROM reviewer_decisions
-           WHERE vendor_name = %s
-           ORDER BY created_at DESC""",
-        (vendor_name.strip().lower(),)
-    )
+    sql = """SELECT decision, risk_score_at_decision, risk_factors, created_at
+             FROM reviewer_decisions WHERE vendor_name = %s"""
+    params = [(vendor_name or "").strip().lower()]
+    if reviewer_id is not None:
+        sql += " AND reviewer_id = %s"
+        params.append(reviewer_id)
+    sql += " ORDER BY created_at DESC"
+    cur.execute(sql, params)
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -83,7 +87,7 @@ def get_vendor_decisions(vendor_name: str) -> list[dict]:
             "decision": r[0],
             "risk_score_at_decision": r[1],
             "risk_factors": r[2],
-            "created_at": r[3].isoformat(),
+            "created_at": r[3].isoformat() if r[3] else None,
         }
         for r in rows
     ]

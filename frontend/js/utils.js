@@ -3,17 +3,27 @@
    No dependencies — safe to load first.
    ============================================================ */
 
+/* Escape any value before interpolating it into an innerHTML template.
+   Document/LLM/DB data is untrusted — a crafted PDF must not inject markup. */
+function escapeHtml(value) {
+  if (value === null || value === undefined) return "";
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function formatCurrency(amount, currency = "USD") {
-  if (amount === null || amount === undefined) return "—";
+  if (amount === null || amount === undefined || amount === "") return "—";
+  const num = Number(amount);
+  if (Number.isNaN(num)) return String(amount);
   try {
-    // Using undefined instead of "en-US" lets the browser automatically 
-    // use the local user's formatting style (commas vs periods etc.)
-    return new Intl.NumberFormat(undefined, { 
-      style: "currency", 
-      currency: currency || "USD" 
-    }).format(amount);
+    // undefined locale = the user's own number formatting
+    return new Intl.NumberFormat(undefined, { style: "currency", currency: currency || "USD" }).format(num);
   } catch {
-    return `${amount}`;
+    return `${num}`;
   }
 }
 

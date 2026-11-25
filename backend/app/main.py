@@ -1,78 +1,119 @@
 """
 FastAPI app exposing the LangGraph invoice pipeline, with per-user auth.
 
-Auth routes:
-  POST /api/auth/signup   — create account (email + password, password is hashed)
-  POST /api/auth/login    — verify credentials, issue a JWT
+Public:
+  GET  /, /api/health
+  POST /api/auth/signup        — create account, returns JWT
+  POST /api/auth/login         — OAuth2 form login, returns JWT
+  GET  /ui/                    — the static frontend (when frontend/ exists)
 
-Protected routes (require Authorization: Bearer <token>):
-  POST /api/process        — upload invoice (+ optional PO/GR), stream node-by-node results via SSE
-  GET  /api/runs            — list THIS user's past pipeline runs (session history)
-  GET  /api/runs/{run_id}   — full report for one of THIS user's past runs
-  POST /api/runs/{run_id}/decide  -- Approved or Decline for that process
-  GET /api/invoices/          - List the invoices with user_id in stored 
-  GET /api/invoices/{invoice_id} extract a particular invoice based on invoice id return invoice data 
-  j
-Run with: uvicorn app.main:app --reload
+Protected (Authorization: Bearer <token>):
+  POST /api/process                    — upload invoice (+ optional PO/GR), SSE progress stream
+  POST /api/runs/{run_id}/resume       — approve/reject a run paused for human review
+  GET  /api/runs                       — this user's runs
+  GET  /api/runs/{run_id}              — one run with its report
+  GET  /api/runs/{run_id}/mismatches   — matching results of a run
+  GET  /api/invoices                   — this user's invoices
+  GET  /api/invoices/{invoice_id}      — invoice + line items + latest run id
+  GET  /api/purchase_orders/{po_number}
+  GET  /api/goods_receipts/{po_number}
+
+Run from the project root:  python -m uvicorn backend.app.main:app --reload --port 8000
 """
 
-import os
 import json
+import logging
+import os
 import shutil
 import tempfile
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+
 from dotenv import load_dotenv
 
-from contextlib import asynccontextmanager
-from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.errors import GraphInterrupt
-from langgraph.types import Command
+load_dotenv()
+
+from email_validator import validate_email, EmailNotValidError
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.staticfiles import StaticFiles
+from langgraph.types import Command
 from pydantic import BaseModel, EmailStr
-from email_validator import validate_email, EmailNotValidError
 
-# These import from your existing pipeline module — adjust the import path
-# to wherever create_graph/nodes/paths actually live in your project.
 from backend.app.agent import create_graph, nodes, paths
-from backend.app.db import get_connection
+from backend.app import db
 from backend.app.auth import hash_password, verify_password, create_access_token, get_current_user_id
 from backend.app.auth_db import (
     init_auth_db, create_user, get_user_by_email, update_run_report,
     insert_pipeline_run, list_pipeline_runs, get_pipeline_run,
-    VALID_DECISIONS, update_run_decision
+    VALID_DECISIONS, update_run_decision, claim_run_for_resume, release_run_claim,
+    PENDING_STATUS,
 )
+from backend.app.helper import jsonable
+from backend.app.report import generate_report, generate_stopped_report
+from backend.app.schemas import MatchResult
+from backend.app.anomaly_detection.predict import load_models, set_models
+from backend.app.anomaly_detection.train import retrain_in_background
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("fincheck")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+FRONTEND_DIR = PROJECT_ROOT / "frontend"
+MAX_UPLOAD_BYTES = int(float(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def initialize_database():
+    """Create/upgrade application tables (idempotent)."""
+    db.init_db()
+    init_auth_db()
+    try:
+        db.migrate_per_user_uniqueness()
+    except Exception as exc:  # e.g. legacy data violating the new per-user index
+        logger.warning("Per-user uniqueness migration failed (duplicates checks still run in code): %s", exc)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from langgraph.checkpoint.postgres import PostgresSaver
+
+    if _env_flag("AUTO_INIT_DB", True):
+        initialize_database()
+
+    set_models(load_models())   # models already on disk, available immediately
+    retrain_in_background()     # refresh from the DB without blocking startup
+
     with PostgresSaver.from_conn_string(os.getenv("DB_URL")) as checkpointer:
         checkpointer.setup()
-
         app.state.checkpointer = checkpointer
-        app.state.pipeline = create_graph(
-            nodes,
-            paths,
-            checkpointer=checkpointer
-        )
-
+        app.state.pipeline = create_graph(nodes, paths, checkpointer=checkpointer)
         yield
 
-app = FastAPI(title="FinCheck Invoice Automation", lifespan=lifespan)
-# init_auth_db()  # ensures users/pipeline_runs tables + user_id columns exist on startup
 
-# Allow the frontend dev server to call this API during local development.
-# Tighten allow_origins to your actual deployed frontend URL before shipping.
+app = FastAPI(title="FinCheck Invoice Automation", lifespan=lifespan)
+
+# CORS: set CORS_ORIGINS to a comma-separated list (e.g. your Vercel URL) in production.
+# Auth uses bearer headers, not cookies, so credentials are not needed for "*".
+_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_origins,
+    allow_credentials=_origins != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ============================================================
 # AUTH ROUTES
@@ -81,290 +122,16 @@ app.add_middleware(
 class SignupRequest(BaseModel):
     email: EmailStr
     password: str
-    
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
 
+
 @app.get("/")
 def home():
-    return {"status": "ok"}
-
-@app.post("/api/auth/signup", response_model=TokenResponse)
-def signup(payload: SignupRequest):
-    try:
-        validated = validate_email(
-            payload.email,
-            check_deliverability=True
-        )
-        email = validated.normalized
-    except EmailNotValidError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
-    if len(payload.password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
-
-    existing = get_user_by_email(payload.email)
-    if existing:
-        raise HTTPException(status_code=409, detail="An account with this email already exists.")
-
-    password_hash = hash_password(payload.password)
-    user_id = create_user(payload.email, password_hash)
-
-    token = create_access_token(user_id, payload.email)
-    return TokenResponse(access_token=token)
-
-
-@app.post("/api/auth/login", response_model=TokenResponse)
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    # OAuth2PasswordRequestForm expects 'username' + 'password' fields —
-    # we treat 'username' as the email address here.
-    user = get_user_by_email(form_data.username)
-    if user is None or not verify_password(form_data.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Incorrect email or password.")
-
-    token = create_access_token(user["id"], user["email"])
-    return TokenResponse(access_token=token)
-
-# Human-readable labels for each node — shown in the frontend's live progress UI
-NODE_LABELS = {
-    "extraction": "Extracting document fields",
-    "validation": "Validating extracted data",
-    "duplicate_detect": "Checking for duplicates",
-    "3_way_matching": "Matching invoice against PO/GR",
-    "classify": "Classifying expense category",
-    "risk_analysis": "Assessing risk",
-    "approval": "Routing for approval",
-    "report_gen": "Generating report",
-}
-
-
-def save_upload(file: Optional[UploadFile], dest_dir: Path) -> Optional[str]:
-    """Save an uploaded file to a temp dir, return its path (or None if no file given)."""
-    if file is None:
-        return None
-    dest_path = dest_dir / file.filename
-    with open(dest_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    return str(dest_path)
-
-
-def sse_event(event: str, data: dict) -> str:
-    """Format a single Server-Sent Event message."""
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
-@app.post("/api/process")
-async def process_invoice(
-    invoice: UploadFile = File(...),
-    po: Optional[UploadFile] = File(None),
-    gr: Optional[UploadFile] = File(None),
-    user_id: int = Depends(get_current_user_id),
-):
-    run_id = str(uuid.uuid4())
-    tmp_dir = Path(tempfile.mkdtemp(prefix=f"invoice_{run_id}_"))
-
-    try:
-        invoice_path = save_upload(invoice, tmp_dir)
-        po_path = save_upload(po, tmp_dir)
-        gr_path = save_upload(gr, tmp_dir)
-    except Exception as e:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to save uploaded files: {e}",
-        )
-
-    initial_state = {
-        "invoice_path": invoice_path,
-        "po_path": po_path,
-        "gr_path": gr_path,
-        "user_id": user_id,
-    }
-
-    async def event_generator():
-        final_state = {}
-        interrupted = False
-        interrupt_value = None
-        thread_id = str(uuid.uuid4())
-        config = {"configurable": {"thread_id": thread_id}}
-
-        try:
-            for step in app.state.pipeline.stream(initial_state, config=config):
-                for node_name, state_delta in step.items():
-                    if node_name == "__interrupt__":
-                        interrupted = True
-                        interrupt_value = state_delta[0].value
-                        continue
-
-                    if not isinstance(state_delta, dict):
-                        continue
-
-                    label = NODE_LABELS.get(node_name, node_name)
-                    final_state.update(state_delta)
-
-                    yield sse_event(
-                        "node_start",
-                        {"node": node_name, "label": label},
-                    )
-                    yield sse_event(
-                        "node_complete",
-                        {
-                            "node": node_name,
-                            "label": label,
-                            "state_delta": jsonable(state_delta),
-                        },
-                    )
-
-        except GraphInterrupt as e:
-            interrupted = True
-            interrupt_value = e.args[0][0].value if e.args else {}
-
-        except Exception as e:
-            yield sse_event("error", {"message": str(e)})
-            return
-
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-        if interrupted:
-            db_run_id = insert_pipeline_run(
-                user_id=user_id,
-                invoice_id=final_state.get("invoice_db_id"),
-                status="pending_review",
-                report=None,
-                thread_id=thread_id,
-            )
-
-            yield sse_event(
-                "interrupted",
-                {
-                    "message": interrupt_value.get(
-                        "message",
-                        "Pending Human Review",
-                    ),
-                    "thread_id": thread_id,
-                    "run_id": db_run_id,
-                    "status": "pending_review",
-                },
-            )
-            return
-
-        final_status = final_state.get("status", "processed")
-        final_report = jsonable(final_state.get("report"))
-
-        db_run_id = insert_pipeline_run(
-            user_id=user_id,
-            invoice_id=final_state.get("invoice_db_id"),
-            status=final_status,
-            report=final_report,
-            thread_id=thread_id,
-        )
-
-        yield sse_event(
-            "done",
-            {
-                "status": final_status,
-                "report": final_report,
-                "run_id": db_run_id,
-                "thread_id": thread_id,
-            },
-        )
-
-    return StreamingResponse( event_generator(), media_type="text/event-stream",)
-
-@app.post("/api/runs/{run_id}/resume")
-def resume_run(
-    run_id: int,
-    decision: str,
-    note: str | None = None,
-    thread_id: str = None,
-    user_id: int = Depends(get_current_user_id),
-):
-    if decision not in VALID_DECISIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"decision must be one of {VALID_DECISIONS}",
-        )
-
-    if not thread_id:
-        raise HTTPException(
-            status_code=400,
-            detail="thread_id required",
-        )
-
-    config = {"configurable": {"thread_id": thread_id}}
-
-    try:
-        final_state = {}
-
-        for step in app.state.pipeline.stream(
-            Command(
-                resume={
-                    "decision": decision,
-                    "note": note or "",
-                }
-            ),
-            config=config,
-        ):
-            for node_name, state_delta in step.items():
-                if isinstance(state_delta, dict):
-                    final_state.update(state_delta)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    final_report = jsonable(final_state.get("report"))
-    final_status = final_state.get("status", "processed")
-
-    update_run_report(
-        run_id,
-        final_report,
-        final_status,
-    )
-
-    update_run_decision(
-        run_id,
-        user_id,
-        decision,
-        note or "",
-    )
-    return {
-        "run_id": run_id,
-        "decision": decision,
-        "report": final_report,
-        "status": final_status,
-    }
-
-def jsonable(value):
-    """Best-effort conversion of pipeline state values into JSON-safe primitives."""
-    if value is None:
-        return None
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    return value
-
-
-
-@app.get("/api/runs")
-def get_my_runs(user_id: int = Depends(get_current_user_id), limit: int = 50):
-    """Return THIS user's past pipeline runs only — the dashboard's session history."""
-    return list_pipeline_runs(user_id, limit=limit)
-
-
-@app.get("/api/runs/{run_id}")
-def get_my_run(run_id: int, user_id: int = Depends(get_current_user_id)):
-    """
-    Return one past run's full report — scoped to the calling user.
-    Returns 404 (not 403) if the run belongs to someone else, so we don'tp
-    leak whether a given run_id exists at all to users who don't own it.
-    """
-    run = get_pipeline_run(user_id, run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="Run not found.")
-    return run
+    return {"status": "ok", "ui": "/ui/"}
 
 
 @app.get("/api/health")
@@ -372,142 +139,317 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/api/auth/signup", response_model=TokenResponse)
+def signup(payload: SignupRequest):
+    try:
+        email = validate_email(
+            payload.email,
+            check_deliverability=_env_flag("EMAIL_CHECK_DELIVERABILITY", True),
+        ).normalized.lower()
+    except EmailNotValidError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+    if len(payload.password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="Password must be at most 72 bytes.")
+
+    if get_user_by_email(email):
+        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+
+    user_id = create_user(email, hash_password(payload.password))
+    return TokenResponse(access_token=create_access_token(user_id, email))
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    # OAuth2PasswordRequestForm uses 'username'; we treat it as the email address.
+    user = get_user_by_email(form_data.username)
+    if user is None or not verify_password(form_data.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Incorrect email or password.")
+    return TokenResponse(access_token=create_access_token(user["id"], user["email"]))
+
+
+# ============================================================
+# PIPELINE
+# ============================================================
+
+# Human-readable labels for each node — shown in the live progress UI
+NODE_LABELS = {
+    "extract_Invoice": "Extracting invoice",
+    "extract_PurchaseOrder": "Extracting purchase order",
+    "extract_GoodReceipt": "Extracting goods receipt",
+    "validation": "Validating extracted data",
+    "duplicate_detect": "Checking for duplicates",
+    "3_way_matching": "Matching invoice against PO/GR",
+    "classify": "Classifying expense category",
+    "anomaly_detect": "Detecting anomalies from history",
+    "risk_analysis": "Assessing risk",
+    "approval": "Routing for approval",
+    "report_gen": "Generating report",
+}
+
+
+def save_upload(file: Optional[UploadFile], dest_dir: Path, slot: str) -> Optional[str]:
+    """
+    Save an uploaded PDF under a fixed server-chosen name (never the client's
+    filename — prevents path traversal). Enforces size limit and PDF signature.
+    """
+    if file is None or not file.filename:
+        return None
+    dest_path = dest_dir / f"{slot}.pdf"
+    size = 0
+    with open(dest_path, "wb") as out:
+        first = file.file.read(1024 * 1024)
+        if not first.startswith(b"%PDF-"):
+            raise ValueError(f"{slot}: file is not a PDF")
+        chunk = first
+        while chunk:
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                raise ValueError(f"{slot}: file exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit")
+            out.write(chunk)
+            chunk = file.file.read(1024 * 1024)
+    return str(dest_path)
+
+
+def sse_event(event: str, data: dict) -> str:
+    """Format a single Server-Sent Event message."""
+    return f"event: {event}\ndata: {json.dumps(jsonable(data), default=str)}\n\n"
+
+
+def _cleanup_failed_run(user_id: int, state: dict):
+    """Delete rows a failed run inserted so a retry isn't flagged as a duplicate."""
+    try:
+        db.delete_documents(user_id, state.get("invoice_id"), state.get("po_db_id"), state.get("gr_db_id"))
+    except Exception as exc:
+        logger.warning("Cleanup after failed run did not complete: %s", exc)
+
+
+def _provisional_report(state: dict, approval: dict) -> dict:
+    """Report stored while a run awaits human review (so history/comparison can show it)."""
+    return generate_report(
+        invoice=state.get("invoice") or {},
+        validation=(state.get("is_valid"), state.get("validation_errors")),
+        match_result=MatchResult(**(state.get("match_result") or {"matched": False})),
+        classification=state.get("classification"),
+        risk=state.get("risk") or {},
+        approval={**(approval or {}), "decision": "needs_review"},
+        warnings=state.get("warnings") or [],
+        anomaly=state.get("anomaly_result"),
+    )
+
+
+@app.post("/api/process")
+def process_invoice(
+    invoice: UploadFile = File(...),
+    po: Optional[UploadFile] = File(None),
+    gr: Optional[UploadFile] = File(None),
+    user_id: int = Depends(get_current_user_id),
+):
+    run_key = str(uuid.uuid4())
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"invoice_{run_key}_"))
+    try:
+        invoice_path = save_upload(invoice, tmp_dir, "invoice")
+        po_path = save_upload(po, tmp_dir, "po")
+        gr_path = save_upload(gr, tmp_dir, "gr")
+    except ValueError as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"Failed to save uploaded files: {e}")
+
+    if not invoice_path:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="An invoice PDF is required.")
+
+    initial_state = {"invoice_path": invoice_path, "po_path": po_path, "gr_path": gr_path, "user_id": user_id}
+    pipeline = app.state.pipeline
+
+    # A plain (sync) generator: Starlette iterates it in a worker thread, so the
+    # blocking LLM/DB work never stalls the event loop.
+    def event_generator():
+        final_state: dict = {}
+        interrupted = False
+        interrupt_value: dict = {}
+        run_saved = False
+        thread_id = str(uuid.uuid4())
+        config = {"configurable": {"thread_id": thread_id}}
+
+        try:
+            for mode, chunk in pipeline.stream(initial_state, config=config, stream_mode=["updates", "tasks"]):
+                if mode == "tasks":
+                    if "input" in chunk:  # task-start event (finish events carry "result")
+                        name = chunk.get("name")
+                        yield sse_event("node_start", {"node": name, "label": NODE_LABELS.get(name, name)})
+                    continue
+                for node_name, state_delta in chunk.items():
+                    if node_name == "__interrupt__":
+                        interrupted = True
+                        interrupt_value = (state_delta[0].value if state_delta else {}) or {}
+                        continue
+                    if not isinstance(state_delta, dict):
+                        continue
+                    final_state.update(state_delta)
+                    yield sse_event("node_complete", {
+                        "node": node_name,
+                        "label": NODE_LABELS.get(node_name, node_name),
+                        "state_delta": state_delta,
+                    })
+
+            status = final_state.get("status") or "processed"
+            if interrupted:
+                report = jsonable(_provisional_report(final_state, interrupt_value.get("approval")))
+                run_id = insert_pipeline_run(user_id, final_state.get("invoice_id"), PENDING_STATUS, report, thread_id)
+                run_saved = True
+                yield sse_event("interrupted", {
+                    "message": interrupt_value.get("message", "Pending human review"),
+                    "thread_id": thread_id,
+                    "run_id": run_id,
+                    "status": PENDING_STATUS,
+                    "report": report,
+                })
+                return
+
+            if status in ("rejected_invalid", "rejected_duplicate"):
+                report = generate_stopped_report(final_state.get("invoice"), status, final_state.get("validation_errors"))
+            else:
+                report = jsonable(final_state.get("report"))
+
+            run_id = insert_pipeline_run(user_id, final_state.get("invoice_id"), status, report, thread_id)
+            run_saved = True
+            yield sse_event("done", {"status": status, "report": report, "run_id": run_id, "thread_id": thread_id})
+            if status == "processed":
+                retrain_in_background()
+
+        except GeneratorExit:  # client disconnected mid-run
+            if not run_saved:
+                _cleanup_failed_run(user_id, final_state)
+            raise
+        except Exception as e:
+            logger.exception("Pipeline run failed")
+            if not run_saved:
+                _cleanup_failed_run(user_id, final_state)
+            yield sse_event("error", {"message": str(e)})
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/runs/{run_id}/resume")
+def resume_run(
+    run_id: int,
+    decision: str,
+    note: str | None = None,
+    thread_id: str | None = None,   # optional/legacy: the server looks up the run's own thread
+    user_id: int = Depends(get_current_user_id),
+):
+    if decision not in VALID_DECISIONS:
+        raise HTTPException(status_code=400, detail=f"decision must be one of {sorted(VALID_DECISIONS)}")
+
+    run_thread = claim_run_for_resume(user_id, run_id)
+    if run_thread is None:
+        if get_pipeline_run(user_id, run_id) is None:
+            raise HTTPException(status_code=404, detail="Run not found.")
+        raise HTTPException(status_code=409, detail="This run is not awaiting review.")
+
+    if thread_id and thread_id != run_thread:
+        release_run_claim(user_id, run_id)
+        raise HTTPException(status_code=400, detail="thread_id does not match this run.")
+
+    pipeline = app.state.pipeline
+    config = {"configurable": {"thread_id": run_thread}}
+    try:
+        snapshot = pipeline.get_state(config)
+        if "approval" not in (snapshot.next or ()):
+            raise LookupError("No paused checkpoint found for this run.")
+
+        final_state: dict = {}
+        for step in pipeline.stream(Command(resume={"decision": decision, "note": note or ""}), config=config):
+            for _node, state_delta in step.items():
+                if isinstance(state_delta, dict):
+                    final_state.update(state_delta)
+
+        report = jsonable(final_state.get("report"))
+        if not report:
+            raise RuntimeError("Pipeline resumed but produced no report.")
+        status = final_state.get("status") or "processed"
+
+        update_run_report(run_id, user_id, report, status)
+        update_run_decision(run_id, user_id, decision, note or "")
+    except LookupError as e:
+        release_run_claim(user_id, run_id)
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.exception("Resume failed for run %s", run_id)
+        release_run_claim(user_id, run_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    retrain_in_background()
+    return {"run_id": run_id, "decision": decision, "report": report, "status": status}
+
+
+# ============================================================
+# READ ENDPOINTS (all user-scoped)
+# ============================================================
+
+@app.get("/api/runs")
+def get_my_runs(user_id: int = Depends(get_current_user_id), limit: int = 50):
+    return list_pipeline_runs(user_id, limit=max(1, min(limit, 200)))
+
+
+@app.get("/api/runs/{run_id}")
+def get_my_run(run_id: int, user_id: int = Depends(get_current_user_id)):
+    """404 (not 403) for other users' runs so existence isn't leaked."""
+    run = get_pipeline_run(user_id, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return run
+
+
+@app.get("/api/runs/{run_id}/mismatches")
+def get_mismatches(run_id: int, user_id: int = Depends(get_current_user_id)):
+    run = get_pipeline_run(user_id, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    matching = ((run.get("report") or {}).get("stages") or {}).get("matching")
+    if matching is None:
+        raise HTTPException(status_code=404, detail="This run has no matching results.")
+    return matching
+
+
 @app.get("/api/invoices")
 def list_invoices(user_id: int = Depends(get_current_user_id), limit: int = 50):
-    """Returns all invoices belonging to this user."""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """SELECT id, invoice_number, vendor_name, invoice_date,
-                  total_amount, tax_amount, currency, created_at
-           FROM invoices
-           WHERE user_id = %s
-           ORDER BY created_at DESC
-           LIMIT %s""",
-        (user_id, limit)
-    )
-    rows = cur.fetchall()
-    cols = [d[0] for d in cur.description]
-    cur.close()
-    conn.close()
-    return [dict(zip(cols, r)) for r in rows]
+    return jsonable(db.list_invoices(user_id, max(1, min(limit, 200))))
 
 
 @app.get("/api/invoices/{invoice_id}")
 def get_invoice(invoice_id: int, user_id: int = Depends(get_current_user_id)):
-    """Returns one invoice with its line items, scoped to the requesting user."""
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT * FROM invoices WHERE id = %s AND user_id = %s",
-        (invoice_id, user_id)
-    )
-    row = cur.fetchone()
-    if row is None:
-        cur.close()
-        conn.close()
+    invoice = db.get_invoice(user_id, invoice_id)
+    if invoice is None:
         raise HTTPException(status_code=404, detail="Invoice not found.")
+    return jsonable(invoice)
 
-    cols = [d[0] for d in cur.description]
-    invoice = dict(zip(cols, row))
 
-    cur.execute(
-        "SELECT description, quantity, unit_price FROM invoice_line_items WHERE invoice_id = %s",
-        (invoice_id,)
-    )
-    items = cur.fetchall()
-    invoice["line_items"] = [
-        {"description": d, "quantity": q, "unit_price": p}
-        for d, q, p in items
-    ]
-    cur.execute("""
-    SELECT id
-    FROM pipeline_runs
-    WHERE invoice_id = %s
-    AND user_id = %s  
-    """, (invoice_id, user_id))
-    run = cur.fetchone()
-    if run is None: raise HTTPException(status_code=404, detail="For this User and particular invoice run not found")
-    invoice["run_id"] = run[0] if run else None
-    cur.close()
-    conn.close()
-    return invoice
-
- 
-@app.get("/api/purchase_orders/{po_id}")
-def get_purchase_order(po_id: str):
-    "Returns one purchase order with its line iterms, scoped to the requseted invoice"
-    conn = get_connection()
-    curr = conn.cursor()
-
-    curr.execute("SELECT * FROM purchase_orders WHERE po_number = %s", (po_id,))
-    row = curr.fetchone()
-    if row is None:
-        curr.close()
-        conn.close()
+@app.get("/api/purchase_orders/{po_number}")
+def get_purchase_order(po_number: str, user_id: int = Depends(get_current_user_id)):
+    po = db.get_purchase_order(user_id, po_number)
+    if po is None:
         raise HTTPException(status_code=404, detail="Purchase order not found.")
-    
-    cols = [d[0] for d in curr.description]
-    purchase_order = dict(zip(cols, row))
-
-    curr.execute(
-        "SELECT description, quantity, unit_price FROM po_line_items WHERE po_id = %s",
-        (purchase_order['id'],)
-    )
-    items = curr.fetchall()
-    purchase_order["line_items"] = [
-        {"description": d, "quantity": q, "unit_price": p}
-        for d, q, p in items
-    ]
-    curr.close()
-    conn.close()
-    return purchase_order
-
-@app.get("/api/goods_receipts/{po_id}")
-def get_goods_receipt(po_id:str):
-    "Returns one goods receipt with its line iterms, scoped to the requseted invoice"
-    conn = get_connection()
-    curr = conn.cursor()
-    curr.execute("SELECT * FROM goods_receipts WHERE po_number = %s", (po_id,))
-    row = curr.fetchone()
-    if row is None:
-        curr.close()
-        conn.close()
-        raise HTTPException(status_code=404, detail="Goods Receipt  not found.")
-    
-    cols = [d[0] for d in curr.description]
-    goods_receipt = dict(zip(cols, row))
-
-    curr.execute(
-        "SELECT description, quantity_received FROM gr_line_items WHERE gr_id = %s",
-        (goods_receipt['id'],)
-    )
-    items = curr.fetchall()
-    goods_receipt["line_items"] = [
-        {"description": d, "quantity": q}
-        for d, q in items
-    ]
-    curr.close()
-    conn.close()
-    return goods_receipt
+    return jsonable(po)
 
 
-@app.get("/api/runs/{run_id}/mismatches")
-def get_mismatches(run_id: int, user_id:int=Depends(get_current_user_id)):
-    conn = get_connection()
-    curr = conn.cursor()
-    try:
-        curr.execute("""
-            SELECT report 
-            FROM pipeline_runs
-            WHERE id = %s AND user_id = %s
-        """, (run_id, user_id))
-        run = curr.fetchone()
-        if run == None:
-            raise HTTPException(status_code=404, detail="For particular user run not found")
-        mismatches = run[0]['stages']['matching']
-    finally:
-        curr.close()
-        conn.close()
-    return mismatches
+@app.get("/api/goods_receipts/{po_number}")
+def get_goods_receipt(po_number: str, user_id: int = Depends(get_current_user_id)):
+    gr = db.get_goods_receipt(user_id, po_number)
+    if gr is None:
+        raise HTTPException(status_code=404, detail="Goods receipt not found.")
+    return jsonable(gr)
+
+
+# Serve the frontend from the same origin (used by Docker / HF Spaces). Mounted last.
+if FRONTEND_DIR.is_dir():
+    app.mount("/ui", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="ui")

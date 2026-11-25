@@ -117,7 +117,7 @@
             <input type="file" id="poFile" accept="application/pdf">
             <span class="dz-index">02</span>
             <span class="dz-title">Purchase order</span>
-            <span class="dz-sub">Optional — enables matching</span>
+            <span class="dz-sub">Optional — needed for 3-way matching</span>
             <span class="dz-filename"></span>
           </label>
 
@@ -125,7 +125,7 @@
             <input type="file" id="grFile" accept="application/pdf">
             <span class="dz-index">03</span>
             <span class="dz-title">Goods receipt</span>
-            <span class="dz-sub">Optional — enables matching</span>
+            <span class="dz-sub">Optional — needed for 3-way matching</span>
             <span class="dz-filename"></span>
           </label>
 
@@ -147,22 +147,20 @@
            .stage-row-main  (stamp + label + detail, always visible)
            .stage-logs      (expandable log lines, hidden until populated)
       -->
+      <p class="pipeline-error" id="pipelineError" hidden></p>
       <div class="stage-list" id="stageList"></div>
-      <div class="decision-actions" id="decisionActions" hidden>
-          <textarea
-            id="reviewerNote"
-            class="reviewer-note"
-            placeholder="Add a note (optional)..."
-            rows="2"
-          ></textarea>
 
+      <!-- Shown when the pipeline pauses for human review (report.js: showPipelineDecision) -->
+      <div class="decision-panel">
+        <div class="decision-actions" id="decisionActions" hidden>
+          <textarea id="reviewerNote" class="reviewer-note" placeholder="Add a note (optional)..." rows="2"></textarea>
           <div class="decision-btns">
             <button class="btn-approve" id="approveBtn">Approve</button>
             <button class="btn-reject" id="rejectBtn">Reject</button>
           </div>
         </div>
-
         <p class="decision-result" id="decisionResult"></p>
+      </div>
     </section>
 
     <!-- ---- VIEW: REPORT ---- -->
@@ -220,21 +218,17 @@
 
       </div>
 
-      <!-- Human review: note + approve/reject
-      <div class="decision-actions" id="decisionActions" hidden>
-        <textarea
-          id="reviewerNote"
-          class="reviewer-note"
-          placeholder="Add a note (optional)..."
-          rows="2"
-        ></textarea>
-        <div class="decision-btns">
-          <button class="btn-approve" id="approveBtn">Approve</button>
-          <button class="btn-reject" id="rejectBtn">Reject</button>
+      <!-- Human review for runs opened from history that are still pending (report.js: setupReportDecision) -->
+      <div class="decision-panel">
+        <div class="decision-actions" id="reportDecisionActions" hidden>
+          <textarea id="reportReviewerNote" class="reviewer-note" placeholder="Add a note (optional)..." rows="2"></textarea>
+          <div class="decision-btns">
+            <button class="btn-approve" id="reportApproveBtn">Approve</button>
+            <button class="btn-reject" id="reportRejectBtn">Reject</button>
+          </div>
         </div>
+        <p class="decision-result" id="reportDecisionResult"></p>
       </div>
-
-      <p class="decision-result" id="decisionResult"></p> -->
 
       <button class="btn-secondary" id="backToUploadBtn">Process another invoice</button>
     </section>
