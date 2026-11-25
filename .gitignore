@@ -1,0 +1,26 @@
+# contains the testing ipynb(jupyter notebooks)
+notebooks
+
+# contains api's and db configuration link
+.env
+
+# contains invoice/purchase_order/good_recipt for testing
+/data
+
+# necceassry file __pycache__/
+*.pyc
+
+# virutal enviorment
+renv/
+.venv/
+.local-postgres/
+.local-postgres-password
+.local-postgres.log
+
+# future improvemennts and plan
+todo.txt
+
+# testing fn 
+/test
+
+/models
