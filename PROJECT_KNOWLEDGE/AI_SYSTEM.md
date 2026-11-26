@@ -17,7 +17,7 @@ Three AI components: (1) a fixed LangGraph orchestration graph, (2) Gemini LLM c
 | Use | Entry point | File |
 |---|---|---|
 | Structured extraction (Invoice, PO, GR) | `extract_document(path, prompt, schema)` → `_structured(schema).invoke(...)` | [extracter.py](../backend/app/extracter.py) |
-| One-sentence risk explanation | `explanation(context)` | [anomaly_exp.py](../backend/app/anomaly_exp.py) |
+| One-sentence risk explanation  | `explanation(context)` | [anomaly_exp.py](../backend/app/anomaly_exp.py) |
 
 - One lazily created, cached client: `extracter.get_llm()` (`MODEL_NAME`, default `gemini-2.5-flash`; `API_KEY`). Nothing is constructed at import time.
 - PDFs sent inline as base64 `{"type":"media","mime_type":"application/pdf"}` + text prompt.
