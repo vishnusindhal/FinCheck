@@ -1,0 +1,37 @@
+# Local stack: FinCheck API + UI and a PostgreSQL database.
+#   docker compose up --build      -> http://localhost:7860/ui/
+#
+# API_KEY, MODEL_NAME and JWT_SECRET come from .env. DB_URL in .env is
+# ignored here; the app is pointed at the "db" service instead.
+# Optional .env overrides: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, APP_PORT.
+
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fincheck}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fincheck}
+      POSTGRES_DB: ${POSTGRES_DB:-fincheck}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_URL: postgresql://${POSTGRES_USER:-fincheck}:${POSTGRES_PASSWORD:-fincheck}@db:5432/${POSTGRES_DB:-fincheck}
+    ports:
+      - "${APP_PORT:-7860}:7860"
+    depends_on:
+      db:
+        condition: service_healthy   # app creates its tables at startup
+
+volumes:
+  pgdata:
